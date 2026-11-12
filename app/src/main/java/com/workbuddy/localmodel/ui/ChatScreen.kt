@@ -2,9 +2,8 @@ package com.workbuddy.localmodel.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,9 +14,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -33,7 +31,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -109,11 +106,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             itemsIndexed(messages) { _, message ->
-                MessageBubble(
-                    message = message,
-                    onCopy = copyToClipboard,
-                    onPasteIntoInput = pasteIntoInput
-                )
+                MessageBubble(message, onCopy = copyToClipboard)
             }
             if (generating) {
                 item {
@@ -228,64 +221,48 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 private fun MessageBubble(
     message: ChatMessage,
     streaming: Boolean = false,
-    onCopy: ((String) -> Unit)? = null,
-    onPasteIntoInput: (() -> Unit)? = null
+    onCopy: ((String) -> Unit)? = null
 ) {
     val isUser = message.role == "user"
-    var menuOpen by remember { mutableStateOf(false) }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
     ) {
-        // Box 作为长按菜单的锚点，菜单会贴着气泡弹出而不是跑到屏幕左上角
-        Box {
-            Surface(
-                color = if (isUser) {
-                    MaterialTheme.colorScheme.primaryContainer
-                } else {
-                    MaterialTheme.colorScheme.surfaceVariant
-                },
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .widthIn(max = 320.dp)
-                    .pointerInput(streaming) {
-                        if (!streaming) {
-                            detectTapGestures(onLongPress = { menuOpen = true })
-                        }
-                    }
-            ) {
-                Column(Modifier.padding(10.dp)) {
-                    Text(
-                        if (isUser) "你" else "助手",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.secondary
-                    )
+        Surface(
+            color = if (isUser) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            },
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.widthIn(max = 320.dp)
+        ) {
+            Column(Modifier.padding(10.dp)) {
+                Text(
+                    if (isUser) "你" else "助手",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+                // 长按进入系统选择模式，可拖动选择任意区间后复制
+                SelectionContainer {
                     Text(
                         message.content.ifEmpty { if (streaming) "..." else "" },
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
-            }
-
-            DropdownMenu(
-                expanded = menuOpen,
-                onDismissRequest = { menuOpen = false }
-            ) {
-                DropdownMenuItem(
-                    text = { Text("复制") },
-                    onClick = {
-                        menuOpen = false
-                        onCopy?.invoke(message.content)
-                    }
-                )
-                DropdownMenuItem(
-                    text = { Text("粘贴到输入框") },
-                    onClick = {
-                        menuOpen = false
-                        onPasteIntoInput?.invoke()
-                    }
-                )
+                val copyAction = if (!streaming && message.content.isNotEmpty()) onCopy else null
+                if (copyAction != null) {
+                    Text(
+                        "复制全文",
+                        modifier = Modifier
+                            .align(Alignment.End)
+                            .clickable { copyAction(message.content) }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
     }
