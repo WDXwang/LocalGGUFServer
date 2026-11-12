@@ -1,25 +1,53 @@
 package com.workbuddy.localmodel.model
 
+import android.app.ActivityManager
 import android.content.Context
+import java.io.File
 
 class SettingsStore(context: Context) {
 
     private val prefs = context.getSharedPreferences("local_model_settings", Context.MODE_PRIVATE)
+    private val totalRamMb: Int = runCatching {
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val info = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(info)
+        (info.totalMem / (1024L * 1024L)).toInt()
+    }.getOrDefault(0)
 
     var contextSize: Int
-        get() = prefs.getInt(KEY_CONTEXT, 4096)
+        get() = prefs.getInt(KEY_CONTEXT, if (totalRamMb >= 12 * 1024) 8192 else 4096)
         set(value) = prefs.edit().putInt(KEY_CONTEXT, value).apply()
 
     var threads: Int
-        get() = prefs.getInt(
-            KEY_THREADS,
-            Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
-        )
+        get() = prefs.getInt(KEY_THREADS, defaultThreads())
         set(value) = prefs.edit().putInt(KEY_THREADS, value).apply()
 
     var batchSize: Int
-        get() = prefs.getInt(KEY_BATCH, 512)
+        get() = prefs.getInt(KEY_BATCH, if (totalRamMb >= 12 * 1024) 1024 else 512)
         set(value) = prefs.edit().putInt(KEY_BATCH, value).apply()
+
+    /**
+     * 默认线程数取「最高频那一簇」的核数，不再直接用总核数。
+     *
+     * big.LITTLE 上把小核也拉进 llama.cpp 的同步屏障，会被最慢的核拖住；
+     * 天玑 9300+ 这类 4×X4 + 4×A720 的机器上，4 线程（只用 X4）通常比 8 线程快 20%~40%。
+     */
+    private fun defaultThreads(): Int {
+        val cores = Runtime.getRuntime().availableProcessors()
+        val fallback = cores.coerceIn(2, 8)
+        val freqKHz = (0 until cores).mapNotNull { cpu ->
+            runCatching {
+                val file = File("/sys/devices/system/cpu/cpu$cpu/cpufreq/cpuinfo_max_freq")
+                if (file.canRead()) file.readText().trim().toLongOrNull() else null
+            }.getOrNull()
+        }
+        if (freqKHz.size != cores) return fallback
+        val peak = freqKHz.maxOrNull() ?: return fallback
+        // 频率达到峰值 80% 以上的核心视为大核
+        val big = freqKHz.count { it >= peak * 0.8 }
+        return big.coerceIn(2, 8)
+    }
+
 
     var gpuLayers: Int
         get() = prefs.getInt(KEY_GPU_LAYERS, 0)

@@ -49,11 +49,14 @@ android {
                     "-DCMAKE_CXX_FLAGS_DEBUG=-O3 -g"
                 )
 
-                // 可选：编译期启用 ARMv8.2 的 dotprod/fp16 指令，量化矩阵乘可再快约 1.5~2 倍。
-                // 默认关闭：ARMv8.2 之前的老机型（如 Cortex-A53）会因非法指令 SIGILL 崩溃。
-                // 确认机型支持后可用 gradle assembleDebug -ParmDotprod 构建。
-                if (project.hasProperty("armDotprod")) {
-                    arguments += "-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16"
+                // 可选：编译期指定 ARM 目标微架构，启用 dotprod / i8mm / fp16 等指令。
+                // 默认关闭：低于目标要求的机型会因非法指令 SIGILL 崩溃。
+                // 用法：gradle assembleDebug -ParmArch=armv8.6-a+dotprod+i8mm+fp16
+                //      -ParmDotprod 是 armv8.2-a+dotprod+fp16 的简写。
+                val armArch = (project.findProperty("armArch") as String?)?.takeIf { it.isNotBlank() }
+                    ?: if (project.hasProperty("armDotprod")) "armv8.2-a+dotprod+fp16" else null
+                if (armArch != null) {
+                    arguments += "-DGGML_CPU_ARM_ARCH=$armArch"
                 }
             }
         }
