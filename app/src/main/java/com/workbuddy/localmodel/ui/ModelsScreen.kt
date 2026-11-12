@@ -159,8 +159,19 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                             settings.gpuLayers = config.gpuLayers
                             scope.launch {
                                 message = null
+                                // 记录加载前的模型，用于判断这次是"换模型"还是"重载同一个"
+                                val previousPath = LlamaEngine.currentInfo?.path
                                 LlamaEngine.load(model.file, config)
-                                    .onSuccess { settings.lastModelPath = model.file.absolutePath }
+                                    .onSuccess { loaded ->
+                                        settings.lastModelPath = model.file.absolutePath
+                                        if (previousPath != null && previousPath != loaded.path) {
+                                            // 换了模型：旧对话对新模型没有意义，直接重置
+                                            ChatStore.resetAfterModelSwitch(loaded.name)
+                                            message = "模型已切换，对话已重置"
+                                        } else {
+                                            message = "已加载 ${loaded.name}"
+                                        }
+                                    }
                                     .onFailure { message = it.message }
                             }
                         },

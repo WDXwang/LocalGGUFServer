@@ -44,6 +44,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     val streaming by ChatStore.streaming.collectAsStateWithLifecycle()
     val generating by ChatStore.generating.collectAsStateWithLifecycle()
     val error by ChatStore.error.collectAsStateWithLifecycle()
+    val notice by ChatStore.notice.collectAsStateWithLifecycle()
 
     var input by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -102,6 +103,25 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                 )
                 TextButton(onClick = { ChatStore.clearError() }) {
                     Text("关闭")
+                }
+            }
+        }
+
+        notice?.let { text ->
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                TextButton(onClick = { ChatStore.clearNotice() }) {
+                    Text("知道了")
                 }
             }
         }
