@@ -110,4 +110,9 @@ object ChatStore {
     fun clearNotice() {
         _notice.value = null
     }
+
+    /** 临时提示（例如"已复制到剪贴板"） */
+    fun showNotice(text: String) {
+        _notice.value = text
+    }
 }

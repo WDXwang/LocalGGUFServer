@@ -1,5 +1,8 @@
 package com.workbuddy.localmodel.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -22,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -52,6 +57,21 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     val ready = engineState is EngineState.Ready
     val itemCount = messages.size + if (generating) 1 else 0
 
+    val context = LocalContext.current
+    val clipboard = remember(context) { context.getSystemService(ClipboardManager::class.java) }
+    val copyToClipboard: (String) -> Unit = { text ->
+        clipboard?.setPrimaryClip(ClipData.newPlainText("LocalGGUFServer", text))
+        ChatStore.showNotice("已复制到剪贴板")
+    }
+    val pasteFromClipboard: () -> String = {
+        val clip = clipboard?.primaryClip
+        if (clip != null && clip.itemCount > 0) {
+            clip.getItemAt(0).coerceToText(context).toString()
+        } else {
+            ""
+        }
+    }
+
     LaunchedEffect(itemCount, streaming.length) {
         if (itemCount > 0) {
             // 流式输出时每个 chunk 都会触发本 effect，用 scrollToItem 直接定位，
@@ -76,7 +96,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             itemsIndexed(messages) { _, message ->
-                MessageBubble(message)
+                MessageBubble(message, onCopy = copyToClipboard)
             }
             if (generating) {
                 item {
@@ -143,6 +163,20 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                     Text("停止")
                 }
             } else {
+                if (input.isBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            val pasted = pasteFromClipboard()
+                            if (pasted.isNotBlank()) {
+                                input = pasted
+                            } else {
+                                ChatStore.showNotice("剪贴板里没有可粘贴的文本")
+                            }
+                        }
+                    ) {
+                        Text("粘贴")
+                    }
+                }
                 Button(
                     onClick = {
                         val text = input
@@ -180,7 +214,11 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun MessageBubble(message: ChatMessage, streaming: Boolean = false) {
+private fun MessageBubble(
+    message: ChatMessage,
+    streaming: Boolean = false,
+    onCopy: ((String) -> Unit)? = null
+) {
     val isUser = message.role == "user"
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -201,10 +239,25 @@ private fun MessageBubble(message: ChatMessage, streaming: Boolean = false) {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.secondary
                 )
-                Text(
-                    message.content.ifEmpty { if (streaming) "..." else "" },
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                // 支持长按选中、拖动选择并复制部分文字
+                SelectionContainer {
+                    Text(
+                        message.content.ifEmpty { if (streaming) "..." else "" },
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                val copyAction = if (!streaming && message.content.isNotEmpty()) onCopy else null
+                if (copyAction != null) {
+                    Text(
+                        "复制",
+                        modifier = Modifier
+                            .align(Alignment.End)
+                            .clickable { copyAction(message.content) }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
     }
