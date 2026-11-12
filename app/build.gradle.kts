@@ -42,7 +42,11 @@ android {
                     "-DGGML_NATIVE=OFF",
                     "-DGGML_LLAMAFILE=OFF",
                     "-DGGML_VULKAN=OFF",
-                    "-DGGML_OPENCL=OFF"
+                    "-DGGML_OPENCL=OFF",
+                    // Debug 变体默认给 C/C++ 传 -O0，llama.cpp 的量化矩阵乘在 -O0 下会慢数倍；
+                    // 这里把 Debug 的优化等级拉到 -O3（保留 -g 便于栈回溯）
+                    "-DCMAKE_C_FLAGS_DEBUG=-O3 -g",
+                    "-DCMAKE_CXX_FLAGS_DEBUG=-O3 -g"
                 )
             }
         }
