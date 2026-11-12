@@ -16,9 +16,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.InputStream
 import java.net.URLDecoder
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 
@@ -71,6 +73,13 @@ class ApiServer(
                     json(Response.Status.NOT_FOUND, errorBody("接口不存在: $path", "invalid_request_error"))
                 )
             }
+        } catch (e: JSONException) {
+            withCors(
+                json(
+                    Response.Status.BAD_REQUEST,
+                    errorBody("请求体不是合法的 JSON：${e.message}", "invalid_request_error")
+                )
+            )
         } catch (t: Throwable) {
             withCors(
                 json(
@@ -403,10 +412,29 @@ class ApiServer(
     // ---------------- 请求解析 ----------------
 
     private fun readJsonBody(session: IHTTPSession): JSONObject {
-        val map = HashMap<String, String>()
-        session.parseBody(map)
-        val raw = map["postData"] ?: ""
+        val raw = readRawBody(session)
         return if (raw.isBlank()) JSONObject() else JSONObject(raw)
+    }
+
+    /**
+     * 直接读取 Content-Length 指定的原始请求体，按 UTF-8 解码。
+     *
+     * NanoHTTPD 2.3.1 的 parseBody() 会用 Content-Type 中的 charset 解码请求体，
+     * 而多数 OpenAI 客户端发送的是不带 charset 的 `application/json`，
+     * 此时 NanoHTTPD 会回退到 US-ASCII，中文等非 ASCII 字符会被不可逆地破坏。
+     */
+    private fun readRawBody(session: IHTTPSession): String {
+        val length = session.headers["content-length"]?.trim()?.toIntOrNull() ?: 0
+        if (length <= 0) return ""
+        val buffer = ByteArray(length)
+        var read = 0
+        val input = session.inputStream
+        while (read < length) {
+            val n = input.read(buffer, read, length - read)
+            if (n <= 0) break
+            read += n
+        }
+        return String(buffer, 0, read, Charsets.UTF_8)
     }
 
     private fun readParams(request: JSONObject): GenParams {
@@ -442,11 +470,19 @@ class ApiServer(
 
     private fun isAuthorized(session: IHTTPSession): Boolean {
         if (apiKey.isBlank()) return true
-        val header = session.headers["authorization"]
-            ?: session.headers["x-api-key"]
+        val header = session.headers["authorization"]?.trim()
+            ?: session.headers["x-api-key"]?.trim()
             ?: return false
-        val token = header.removePrefix("Bearer ").trim()
-        return token == apiKey
+        val token = if (header.startsWith("Bearer ", ignoreCase = true)) {
+            header.substring(7).trim()
+        } else {
+            header
+        }
+        if (token.isEmpty()) return false
+        return MessageDigest.isEqual(
+            token.toByteArray(Charsets.UTF_8),
+            apiKey.toByteArray(Charsets.UTF_8)
+        )
     }
 
     private fun normalizePath(uri: String): String {

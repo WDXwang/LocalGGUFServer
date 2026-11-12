@@ -53,7 +53,9 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 
     LaunchedEffect(itemCount, streaming.length) {
         if (itemCount > 0) {
-            listState.animateScrollToItem(itemCount - 1)
+            // 流式输出时每个 chunk 都会触发本 effect，用 scrollToItem 直接定位，
+            // 避免 animateScrollToItem 被反复打断导致列表抖动
+            listState.scrollToItem(itemCount - 1)
         }
     }
 

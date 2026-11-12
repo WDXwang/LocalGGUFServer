@@ -3,7 +3,8 @@ set -euo pipefail
 
 # 拉取 llama.cpp 到 app/src/main/cpp/llama.cpp（固定版本，保证 JNI 接口匹配）
 REPO="https://github.com/ggml-org/llama.cpp"
-COMMIT="dd6b945be2188da875ab05a259ce94c6b2736e64"   # 2026-11-12 master
+# 固定到已验证可编译的提交，JNI 接口（llama.h）与该版本匹配
+COMMIT="5d4c8eeb24db049acf74bd6f354bed6eaeffc7dc"   # master @ 2026-11-12
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="$ROOT_DIR/app/src/main/cpp/llama.cpp"
@@ -26,7 +27,7 @@ mkdir -p "$DEST"
 git -C "$DEST" init -q
 git -C "$DEST" remote add origin "$REPO"
 git -C "$DEST" sparse-checkout init --cone
-git -C "$DEST" sparse-checkout set include src ggml cmake vendor
+git -C "$DEST" sparse-checkout set include src ggml cmake vendor common licenses
 
 if ! git -C "$DEST" fetch --depth 1 origin "$COMMIT"; then
     echo "[error] 拉取指定提交失败，请检查网络后重试。"

@@ -182,7 +182,8 @@ struct JavaCallback {
         }
         const jint ret = g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
         if (ret == JNI_EDETACHED) {
-            if (g_vm->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr) != JNI_OK) {
+            // C++ 下 AttachCurrentThread 的签名是 (JNIEnv **, void *)，不能再转成 void **
+            if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
                 return false;
             }
             attached = true;
