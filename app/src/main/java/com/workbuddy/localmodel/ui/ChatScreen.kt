@@ -185,7 +185,10 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                             text,
                             GenParams(
                                 maxTokens = app.settings.maxTokens,
-                                temperature = app.settings.temperature
+                                temperature = app.settings.temperature,
+                                topP = app.settings.topP,
+                                repeatPenalty = app.settings.repeatPenalty,
+                                systemPrompt = app.settings.systemPrompt
                             )
                         )
                     },

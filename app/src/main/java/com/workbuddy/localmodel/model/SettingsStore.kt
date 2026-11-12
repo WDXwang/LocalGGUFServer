@@ -69,6 +69,24 @@ class SettingsStore(context: Context) {
         get() = prefs.getFloat(KEY_TEMPERATURE, 0.7f)
         set(value) = prefs.edit().putFloat(KEY_TEMPERATURE, value).apply()
 
+    var topP: Float
+        get() = prefs.getFloat(KEY_TOP_P, 0.95f)
+        set(value) = prefs.edit().putFloat(KEY_TOP_P, value).apply()
+
+    var repeatPenalty: Float
+        get() = prefs.getFloat(KEY_REPEAT_PENALTY, 1.1f)
+        set(value) = prefs.edit().putFloat(KEY_REPEAT_PENALTY, value).apply()
+
+    /** 当前生效的系统提示词，空串表示不带系统提示词 */
+    var systemPrompt: String
+        get() = prefs.getString(KEY_SYSTEM_PROMPT, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_SYSTEM_PROMPT, value).apply()
+
+    /** 当前选中的预设名，用于界面回显；「自定义」或空串表示用户自己写的 */
+    var presetName: String
+        get() = prefs.getString(KEY_PRESET_NAME, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_PRESET_NAME, value).apply()
+
     var lastModelPath: String?
         get() = prefs.getString(KEY_LAST_MODEL, null)
         set(value) = prefs.edit().putString(KEY_LAST_MODEL, value).apply()
@@ -82,6 +100,10 @@ class SettingsStore(context: Context) {
         const val KEY_API_KEY = "api_key"
         const val KEY_MAX_TOKENS = "max_tokens"
         const val KEY_TEMPERATURE = "temperature"
+        const val KEY_TOP_P = "top_p"
+        const val KEY_REPEAT_PENALTY = "repeat_penalty"
+        const val KEY_SYSTEM_PROMPT = "system_prompt"
+        const val KEY_PRESET_NAME = "preset_name"
         const val KEY_LAST_MODEL = "last_model"
     }
 }

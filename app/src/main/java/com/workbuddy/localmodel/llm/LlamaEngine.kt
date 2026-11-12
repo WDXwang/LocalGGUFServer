@@ -104,10 +104,17 @@ object LlamaEngine {
             return@withLock Result.failure(IllegalStateException("尚未加载模型"))
         }
         try {
+            // 预设的系统提示词作为第一条 system 消息参与 chat 模板；
+            // 调用方自己已经带了 system 消息就不重复插入
+            val effective = if (params.systemPrompt.isBlank() || messages.firstOrNull()?.role == "system") {
+                messages
+            } else {
+                listOf(ChatMessage("system", params.systemPrompt)) + messages
+            }
             val prompt = LlamaBridge.nativeBuildPrompt(
                 h,
-                messages.map { it.role }.toTypedArray(),
-                messages.map { it.content }.toTypedArray(),
+                effective.map { it.role }.toTypedArray(),
+                effective.map { it.content }.toTypedArray(),
                 true
             )
             generateLocked(h, prompt, params, onToken)

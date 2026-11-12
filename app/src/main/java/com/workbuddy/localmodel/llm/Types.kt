@@ -29,7 +29,9 @@ data class GenParams(
     val topK: Int = 40,
     val minP: Float = 0.05f,
     val repeatPenalty: Float = 1.1f,
-    val seed: Int = -1
+    val seed: Int = -1,
+    /** 非空时作为 system 消息插在对话最前面，走模型自带的 chat 模板 */
+    val systemPrompt: String = ""
 )
 
 data class GenResult(

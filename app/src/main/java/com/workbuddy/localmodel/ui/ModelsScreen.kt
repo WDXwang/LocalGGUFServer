@@ -3,6 +3,7 @@ package com.workbuddy.localmodel.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -16,6 +17,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -65,6 +68,14 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
     var importProgress by remember { mutableFloatStateOf(0f) }
     var message by remember { mutableStateOf<String?>(null) }
 
+    // 提示词预设相关状态，与 SettingsStore 双向同步
+    var presetName by rememberSaveable { mutableStateOf(settings.presetName) }
+    var systemText by rememberSaveable { mutableStateOf(settings.systemPrompt) }
+    var tempText by rememberSaveable { mutableStateOf(settings.temperature.toString()) }
+    var topPText by rememberSaveable { mutableStateOf(settings.topP.toString()) }
+    var repeatText by rememberSaveable { mutableStateOf(settings.repeatPenalty.toString()) }
+    var presetMenuOpen by remember { mutableStateOf(false) }
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
@@ -84,6 +95,10 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
     }
 
     val selectedModel: ModelFile? = models.firstOrNull { it.file.absolutePath == selectedPath }
+
+    // 预设组按「选中的模型」取，未选中时回落到当前已加载的模型
+    val presetModelName: String? = selectedModel?.name ?: LlamaEngine.currentInfo?.name
+    val presets: List<PromptPreset> = PromptPresets.forModel(presetModelName)
 
     Column(
         modifier = modifier
@@ -164,13 +179,31 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                                 LlamaEngine.load(model.file, config)
                                     .onSuccess { loaded ->
                                         settings.lastModelPath = model.file.absolutePath
+                                        var note = "已加载 ${loaded.name}"
                                         if (previousPath != null && previousPath != loaded.path) {
                                             // 换了模型：旧对话对新模型没有意义，直接重置
                                             ChatStore.resetAfterModelSwitch(loaded.name)
-                                            message = "模型已切换，对话已重置"
-                                        } else {
-                                            message = "已加载 ${loaded.name}"
+                                            note = "模型已切换，对话已重置"
                                         }
+                                        // 第一次为这个模型家族加载时，自动套用该家族的第一条预设
+                                        val family = PromptPresets.forModel(loaded.name)
+                                        if (family.isNotEmpty() && presetName != PromptPresets.CUSTOM_NAME &&
+                                            family.none { it.name == presetName }
+                                        ) {
+                                            val p = family.first()
+                                            presetName = p.name
+                                            systemText = p.system
+                                            tempText = p.temperature.toString()
+                                            topPText = p.topP.toString()
+                                            repeatText = p.repeatPenalty.toString()
+                                            settings.presetName = p.name
+                                            settings.systemPrompt = p.system
+                                            settings.temperature = p.temperature
+                                            settings.topP = p.topP
+                                            settings.repeatPenalty = p.repeatPenalty
+                                            note += "，已套用预设「${p.name}」"
+                                        }
+                                        message = note
                                     }
                                     .onFailure { message = it.message }
                             }
@@ -246,6 +279,138 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                 }
                 Text(
                     "提示：上下文越大越占内存。当前构建仅启用 CPU 推理，GPU 层数可保持 0。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "提示词预设",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        PromptPresets.familyLabel(presetModelName),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box {
+                        OutlinedButton(onClick = { presetMenuOpen = true }) {
+                            Text(presetName.ifBlank { "选择预设" })
+                        }
+                        DropdownMenu(
+                            expanded = presetMenuOpen,
+                            onDismissRequest = { presetMenuOpen = false }
+                        ) {
+                            presets.forEach { p ->
+                                DropdownMenuItem(
+                                    text = { Text(p.name) },
+                                    onClick = {
+                                        presetMenuOpen = false
+                                        presetName = p.name
+                                        systemText = p.system
+                                        tempText = p.temperature.toString()
+                                        topPText = p.topP.toString()
+                                        repeatText = p.repeatPenalty.toString()
+                                        settings.presetName = p.name
+                                        settings.systemPrompt = p.system
+                                        settings.temperature = p.temperature
+                                        settings.topP = p.topP
+                                        settings.repeatPenalty = p.repeatPenalty
+                                        message = "已套用预设「${p.name}」"
+                                    }
+                                )
+                            }
+                            if (presets.isNotEmpty()) HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text(PromptPresets.CUSTOM_NAME) },
+                                onClick = {
+                                    presetMenuOpen = false
+                                    presetName = PromptPresets.CUSTOM_NAME
+                                    settings.presetName = PromptPresets.CUSTOM_NAME
+                                    message = "已切换到自定义，可手动编辑提示词与参数"
+                                }
+                            )
+                        }
+                    }
+                    Text(
+                        "共 ${presets.size} 条预设",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                }
+                if (presets.isEmpty()) {
+                    Text(
+                        "未识别该模型家族，暂无预设；可直接用下方输入框写自己的系统提示词。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                }
+                OutlinedTextField(
+                    value = systemText,
+                    onValueChange = { v ->
+                        systemText = v
+                        settings.systemPrompt = v
+                        // 手动改过提示词就不再声称是某条预设
+                        if (presetName.isNotBlank() && presetName != PromptPresets.CUSTOM_NAME) {
+                            presetName = PromptPresets.CUSTOM_NAME
+                            settings.presetName = PromptPresets.CUSTOM_NAME
+                        }
+                    },
+                    label = { Text("系统提示词") },
+                    minLines = 3,
+                    maxLines = 8,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = tempText,
+                        onValueChange = { v ->
+                            val text = v.filter { ch -> ch.isDigit() || ch == '.' }
+                            tempText = text
+                            text.toFloatOrNull()?.let { if (it in 0f..2f) settings.temperature = it }
+                        },
+                        label = { Text("温度") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = topPText,
+                        onValueChange = { v ->
+                            val text = v.filter { ch -> ch.isDigit() || ch == '.' }
+                            topPText = text
+                            text.toFloatOrNull()?.let { if (it in 0.05f..1f) settings.topP = it }
+                        },
+                        label = { Text("top_p") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                OutlinedTextField(
+                    value = repeatText,
+                    onValueChange = { v ->
+                        val text = v.filter { ch -> ch.isDigit() || ch == '.' }
+                        repeatText = text
+                        text.toFloatOrNull()?.let { if (it in 0.5f..2f) settings.repeatPenalty = it }
+                    },
+                    label = { Text("重复惩罚") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    "说明：选中预设会同时写入系统提示词与温度 / top_p / 重复惩罚三项参数；" +
+                            "手动修改提示词会自动切换到「自定义」，参数仍可继续微调。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.secondary
                 )
