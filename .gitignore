@@ -18,8 +18,7 @@ app/.cxx/
 # 由 scripts/setup_llama_cpp.sh 拉取，不入库
 app/src/main/cpp/llama.cpp/
 
-# 构建产物
-*.apk
+# 构建产物（APK 不再忽略，按版本放到 releases/ 目录随仓库发布）
 *.aab
 *.ap_
 *.dex
