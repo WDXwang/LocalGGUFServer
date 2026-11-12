@@ -1,30 +1,45 @@
 package com.workbuddy.localmodel.model
 
-import android.app.ActivityManager
 import android.content.Context
 import java.io.File
 
 class SettingsStore(context: Context) {
 
     private val prefs = context.getSharedPreferences("local_model_settings", Context.MODE_PRIVATE)
-    private val totalRamMb: Int = runCatching {
-        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        val info = ActivityManager.MemoryInfo()
-        am.getMemoryInfo(info)
-        (info.totalMem / (1024L * 1024L)).toInt()
-    }.getOrDefault(0)
 
+    /**
+     * 默认上下文 4096。
+     *
+     * 8192 在手机上 prefill 慢、KV 缓存占用近乎翻倍，长时间多轮对话更容易被系统回收；
+     * 需要长上下文时在「加载参数」卡片里手动调大，并配合自动裁剪使用。
+     */
     var contextSize: Int
-        get() = prefs.getInt(KEY_CONTEXT, if (totalRamMb >= 12 * 1024) 8192 else 4096)
+        get() = prefs.getInt(KEY_CONTEXT, 4096)
         set(value) = prefs.edit().putInt(KEY_CONTEXT, value).apply()
 
     var threads: Int
         get() = prefs.getInt(KEY_THREADS, defaultThreads())
         set(value) = prefs.edit().putInt(KEY_THREADS, value).apply()
 
+    /**
+     * 默认 batch 256。
+     *
+     * n_batch 决定 prefill 一次提交多少 token，1024 会让 prefill 的内存峰值和瞬时功耗都很高，
+     * 长时间推理时更容易触发 OOM 或温控杀进程；256 的 prefill 略慢但峰值平缓很多。
+     */
     var batchSize: Int
-        get() = prefs.getInt(KEY_BATCH, if (totalRamMb >= 12 * 1024) 1024 else 512)
+        get() = prefs.getInt(KEY_BATCH, 256)
         set(value) = prefs.edit().putInt(KEY_BATCH, value).apply()
+
+    /**
+     * 权重 mlock 开关，默认开启。
+     *
+     * 手机长时间推理时系统会回收 mmap 的权重页，下次访问缺页会直接崩掉进程；
+     * 开启后权重锁在物理内存，代价是加载稍慢、占用固定。内存不够时 native 侧自动回退 mmap 并打 WARN 日志。
+     */
+    var useMlock: Boolean
+        get() = prefs.getBoolean(KEY_USE_MLOCK, true)
+        set(value) = prefs.edit().putBoolean(KEY_USE_MLOCK, value).apply()
 
     /**
      * 默认线程数取「最高频那一簇」的核数，不再直接用总核数。
@@ -95,6 +110,7 @@ class SettingsStore(context: Context) {
         const val KEY_CONTEXT = "context_size"
         const val KEY_THREADS = "threads"
         const val KEY_BATCH = "batch_size"
+        const val KEY_USE_MLOCK = "use_mlock"
         const val KEY_GPU_LAYERS = "gpu_layers"
         const val KEY_PORT = "server_port"
         const val KEY_API_KEY = "api_key"

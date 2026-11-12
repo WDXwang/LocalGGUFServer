@@ -13,6 +13,7 @@
 
 #define LOG_TAG "LlamaJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
@@ -275,7 +276,7 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeBackendInit(JNIEnv * /*env*/
 JNIEXPORT jlong JNICALL
 Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
         JNIEnv *env, jobject /*thiz*/, jstring path, jint n_threads, jint n_ctx,
-        jint n_batch, jint n_gpu_layers) {
+        jint n_batch, jint n_gpu_layers, jboolean n_mlock) {
 
     const std::string model_path = jstring_to_utf8(env, path);
     if (model_path.empty()) {
@@ -287,7 +288,20 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
 
+    // use_mlock 把权重锁在物理内存里，避免长时间运行被系统回收后缺页崩溃；
+    // 剩余内存不足时会加载失败，所以失败后自动回退到 mmap 模式重试一次
+    const bool want_mlock = (n_mlock == JNI_TRUE) && llama_supports_mlock();
+    // 这一版 llama.cpp 用 load_mode 表达内存锁：MMAP_MLOCK = mmap + 锁在物理内存
+    mparams.load_mode = want_mlock ? LLAMA_LOAD_MODE_MMAP_MLOCK : LLAMA_LOAD_MODE_MMAP;
+    bool mlock_in_use = want_mlock;
+
     session->model = llama_model_load_from_file(model_path.c_str(), mparams);
+    if (session->model == nullptr && want_mlock) {
+        LOGW("mlock load failed (free memory may be insufficient), retrying without mlock");
+        mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
+        mlock_in_use = false;
+        session->model = llama_model_load_from_file(model_path.c_str(), mparams);
+    }
     if (session->model == nullptr) {
         LOGE("failed to load model: %s", model_path.c_str());
         delete session;
@@ -317,8 +331,9 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
         session->chat_template = tmpl;
     }
 
-    LOGI("model loaded: %s (ctx=%u, threads=%d)",
-         model_path.c_str(), llama_n_ctx(session->ctx), cparams.n_threads);
+    LOGI("model loaded: %s (ctx=%u, threads=%d, batch=%u, mlock=%d, mlock_supported=%d)",
+         model_path.c_str(), llama_n_ctx(session->ctx), cparams.n_threads,
+         cparams.n_batch, mlock_in_use ? 1 : 0, llama_supports_mlock() ? 1 : 0);
     return reinterpret_cast<jlong>(session);
 }
 
@@ -667,6 +682,11 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         cb.token(pending);
     }
     llama_sampler_free(smpl);
+
+    // 供 adb logcat -s LlamaJNI 观察 KV 增长趋势，判断是否被上下文上限卡住
+    LOGI("generate done: finish=%d, generated=%d, kv_tokens=%zu, n_ctx=%u",
+         finish_reason, generated, session->kv_tokens.size(),
+         llama_n_ctx(session->ctx));
 
     finish(finish_reason, generated);
     return generated;

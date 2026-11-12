@@ -55,11 +55,18 @@ object ChatStore {
         val snapshot = _messages.value
         val myEpoch = epoch
         scope.launch {
-            val result = LlamaEngine.chat(snapshot, params) { chunk ->
-                if (myEpoch == epoch) {
-                    _streaming.update { it + chunk }
+            val result = LlamaEngine.chat(
+                snapshot,
+                params,
+                onToken = { chunk ->
+                    if (myEpoch == epoch) {
+                        _streaming.update { it + chunk }
+                    }
+                },
+                onNotice = { text ->
+                    if (myEpoch == epoch) _notice.value = text
                 }
-            }
+            )
             if (myEpoch != epoch) {
                 // 生成期间对话已被重置（例如切换了模型），丢弃这次结果
                 _streaming.value = ""

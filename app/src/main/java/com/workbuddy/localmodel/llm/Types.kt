@@ -8,8 +8,10 @@ data class ChatMessage(
 data class LoadConfig(
     val contextSize: Int = 4096,
     val threads: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 8),
-    val batchSize: Int = 512,
-    val gpuLayers: Int = 0
+    val batchSize: Int = 256,
+    val gpuLayers: Int = 0,
+    /** 把权重锁定在物理内存，避免长时间运行被系统回收换出后缺页崩溃 */
+    val useMlock: Boolean = true
 )
 
 data class ModelInfo(

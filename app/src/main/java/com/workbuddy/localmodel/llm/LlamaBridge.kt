@@ -25,7 +25,8 @@ object LlamaBridge {
         nThreads: Int,
         nCtx: Int,
         nBatch: Int,
-        nGpuLayers: Int
+        nGpuLayers: Int,
+        nMlock: Boolean
     ): Long
 
     external fun nativeFreeModel(handle: Long)

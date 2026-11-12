@@ -25,6 +25,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -64,6 +65,7 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
     var threadText by rememberSaveable { mutableStateOf(settings.threads.toString()) }
     var batchText by rememberSaveable { mutableStateOf(settings.batchSize.toString()) }
     var gpuText by rememberSaveable { mutableStateOf(settings.gpuLayers.toString()) }
+    var mlockOn by rememberSaveable { mutableStateOf(settings.useMlock) }
     var importing by remember { mutableStateOf(false) }
     var importProgress by remember { mutableFloatStateOf(0f) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -165,13 +167,15 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                             val config = LoadConfig(
                                 contextSize = contextText.toIntOrNull()?.coerceIn(512, 131072) ?: 4096,
                                 threads = threadText.toIntOrNull()?.coerceIn(1, 32) ?: settings.threads,
-                                batchSize = batchText.toIntOrNull()?.coerceIn(32, 2048) ?: 512,
-                                gpuLayers = gpuText.toIntOrNull()?.coerceAtLeast(0) ?: 0
+                                batchSize = batchText.toIntOrNull()?.coerceIn(32, 2048) ?: 256,
+                                gpuLayers = gpuText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                                useMlock = mlockOn
                             )
                             settings.contextSize = config.contextSize
                             settings.threads = config.threads
                             settings.batchSize = config.batchSize
                             settings.gpuLayers = config.gpuLayers
+                            settings.useMlock = config.useMlock
                             scope.launch {
                                 message = null
                                 // 记录加载前的模型，用于判断这次是"换模型"还是"重载同一个"
@@ -277,8 +281,26 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                         modifier = Modifier.weight(1f)
                     )
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("锁定权重内存 (mlock)", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "长时间推理时防止权重页被系统回收导致中途退出；内存不足会自动回退",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    Switch(
+                        checked = mlockOn,
+                        onCheckedChange = {
+                            mlockOn = it
+                            settings.useMlock = it
+                        }
+                    )
+                }
                 Text(
-                    "提示：上下文越大越占内存。当前构建仅启用 CPU 推理，GPU 层数可保持 0。",
+                    "提示：上下文越大越占内存，Batch 越大 prefill 越快但内存峰值和发热也越高。" +
+                        "7B 建议 上下文 4096 / Batch 256 / 线程 4；当前构建仅启用 CPU 推理，GPU 层数可保持 0。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.secondary
                 )

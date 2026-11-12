@@ -47,7 +47,8 @@ object LlamaEngine {
                         nThreads = config.threads,
                         nCtx = config.contextSize,
                         nBatch = config.batchSize,
-                        nGpuLayers = config.gpuLayers
+                        nGpuLayers = config.gpuLayers,
+                        nMlock = config.useMlock
                     )
                     if (h == 0L) {
                         val message = "模型加载失败，请确认文件是有效的 GGUF 且内存充足"
@@ -97,7 +98,8 @@ object LlamaEngine {
     suspend fun chat(
         messages: List<ChatMessage>,
         params: GenParams,
-        onToken: (String) -> Unit = {}
+        onToken: (String) -> Unit = {},
+        onNotice: (String) -> Unit = {}
     ): Result<GenResult> = generationMutex.withLock {
         val h = handle
         if (h == 0L) {
@@ -106,21 +108,75 @@ object LlamaEngine {
         try {
             // 预设的系统提示词作为第一条 system 消息参与 chat 模板；
             // 调用方自己已经带了 system 消息就不重复插入
-            val effective = if (params.systemPrompt.isBlank() || messages.firstOrNull()?.role == "system") {
+            var effective = if (params.systemPrompt.isBlank() || messages.firstOrNull()?.role == "system") {
                 messages
             } else {
                 listOf(ChatMessage("system", params.systemPrompt)) + messages
             }
-            val prompt = LlamaBridge.nativeBuildPrompt(
+            var prompt = LlamaBridge.nativeBuildPrompt(
                 h,
                 effective.map { it.role }.toTypedArray(),
                 effective.map { it.content }.toTypedArray(),
                 true
             )
+
+            // 上下文保护：prompt 超过 n_ctx 的 80%（再预留生成长度）时，从最早的非 system 消息开始丢弃。
+            // 只裁"发给模型的副本"，UI 里的历史消息原样保留，用户不会看到消息凭空消失。
+            val ctx = info?.contextSize ?: 0
+            if (ctx > 0 && effective.size > 1) {
+                val reserve = params.maxTokens.coerceIn(0, ctx / 4)
+                val limit = (ctx * 8 / 10) - reserve
+                val promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
+                if (promptTokens > limit) {
+                    val trimmed = trimToBudget(h, effective, limit)
+                    if (trimmed.size < effective.size) {
+                        val dropped = effective.size - trimmed.size
+                        android.util.Log.i(
+                            "LlamaJNI",
+                            "context trim: prompt=$promptTokens > limit=$limit, " +
+                                "dropped $dropped of ${effective.size} messages, kv_reset_on_next_prefill"
+                        )
+                        effective = trimmed
+                        prompt = LlamaBridge.nativeBuildPrompt(
+                            h,
+                            effective.map { it.role }.toTypedArray(),
+                            effective.map { it.content }.toTypedArray(),
+                            true
+                        )
+                        onNotice("上下文即将超限，已自动裁剪早期 $dropped 条历史")
+                    }
+                }
+            }
+
             generateLocked(h, prompt, params, onToken)
         } catch (t: Throwable) {
             Result.failure(t)
         }
+    }
+
+    /**
+     * 逐条丢弃最早的消息，直到 token 数落回预算内。
+     *
+     * 第一条是 system 时保留它，否则整轮对话会被剪成"只有一个问题"，预设提示词也就失效了。
+     * 至少保留最后一条（当前提问）。
+     */
+    private fun trimToBudget(
+        h: Long,
+        messages: List<ChatMessage>,
+        limit: Int
+    ): List<ChatMessage> {
+        var list = messages
+        val keepHead = list.firstOrNull()?.role == "system"
+        while (list.size > 1) {
+            val tokens = LlamaBridge.nativeCountTokens(h, list.joinToString("\n") { it.content })
+            if (tokens <= limit) break
+            list = if (keepHead && list.size > 2) {
+                list.take(1) + list.drop(2)
+            } else {
+                list.drop(1)
+            }
+        }
+        return list
     }
 
     suspend fun complete(
