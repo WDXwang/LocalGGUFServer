@@ -2,6 +2,13 @@
 
 在 Android 手机上直接加载 GGUF 模型进行推理，并通过局域网开放 **OpenAI 兼容 HTTP API**，供 PC 版 WorkBuddy、OpenAI SDK、curl 等客户端调用。
 
+## 下载
+
+- 最新版 APK：[`releases/LocalGGUFServer-1.0.4-debug-D9300.apk`](releases/LocalGGUFServer-1.0.4-debug-D9300.apk)
+- 历史版本：[GitHub Releases](https://github.com/WDXwang/LocalGGUFServer/releases)
+
+约定：仓库 `releases/` 只保留当前最新一个 APK，历史版本放 Releases 附件，避免 git 历史随每个版本线性膨胀。发版流程见 [`releases/README.md`](releases/README.md)。
+
 ## 功能
 
 - **本地推理**：内置 llama.cpp（JNI），纯 CPU 推理，无需联网。
