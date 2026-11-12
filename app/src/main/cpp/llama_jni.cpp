@@ -26,6 +26,11 @@ struct LlamaSession {
     std::string        chat_template;
     std::atomic<bool>  stop{false};
     std::mutex         gen_mutex;
+
+    // KV 复用：记录当前 KV cache 里已经解码过的 token 序列（prompt + 已生成的 token）。
+    // 下次请求若 prompt 与它有公共前缀，只需 decode 新增的那一段，不必整段重新 prefill。
+    // 仅在持有 gen_mutex 时访问。
+    std::vector<llama_token> kv_tokens;
 };
 
 enum FinishReason {
@@ -532,12 +537,37 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         LOGI("prompt truncated to %d tokens", n_tokens);
     }
 
-    // 3. 清空 KV cache
-    llama_memory_clear(llama_get_memory(session->ctx), true);
+    // 3. KV 复用：与上一次的 KV 内容求最长公共前缀，命中则只 decode 新增部分。
+    //    chat 模板是确定性的，多轮对话里前面几轮的消息逐 token 相同，
+    //    因此不必每轮都 llama_memory_clear + 全量重放，首 token 延迟不再随上下文线性增长。
+    llama_memory_t mem = llama_get_memory(session->ctx);
+    int32_t reuse = 0;
+    {
+        const int32_t limit = static_cast<int32_t>(
+                std::min<size_t>(session->kv_tokens.size(), tokens.size()));
+        while (reuse < limit && session->kv_tokens[reuse] == tokens[reuse]) {
+            ++reuse;
+        }
+        // 前缀太短时复用没有收益，直接整段重算，避免 KV 里留下碎片
+        if (reuse < 16) {
+            reuse = 0;
+        }
+    }
+    if (reuse > 0 && !llama_memory_seq_rm(mem, 0, reuse, -1)) {
+        LOGI("llama_memory_seq_rm failed at %d, fall back to full prefill", reuse);
+        reuse = 0;
+    }
+    if (reuse == 0) {
+        llama_memory_clear(mem, true);
+    }
+    session->kv_tokens.resize(static_cast<size_t>(reuse));
+    if (reuse > 0) {
+        LOGI("kv reuse: %d/%d prompt tokens already cached", reuse, n_tokens);
+    }
 
-    // 4. prompt 分批 decode
+    // 4. 只 decode 公共前缀之后的部分（首次请求时 reuse == 0，等于全量 prefill）
     const uint32_t n_batch = llama_n_batch(session->ctx);
-    for (int32_t i = 0; i < n_tokens; i += static_cast<int32_t>(n_batch)) {
+    for (int32_t i = reuse; i < n_tokens; i += static_cast<int32_t>(n_batch)) {
         if (session->stop.load()) {
             finish(FINISH_CANCELLED, 0);
             return 0;
@@ -546,9 +576,14 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         llama_batch batch = llama_batch_get_one(tokens.data() + i, chunk);
         if (llama_decode(session->ctx, batch) != 0) {
             LOGE("llama_decode(prompt) failed at %d", i);
+            // decode 失败后 KV 状态不可信，作废缓存
+            llama_memory_clear(mem, true);
+            session->kv_tokens.clear();
             finish(FINISH_ERROR, 0);
             return -4;
         }
+        session->kv_tokens.insert(session->kv_tokens.end(),
+                                  tokens.begin() + i, tokens.begin() + i + chunk);
     }
 
     // 5. sampler
@@ -614,9 +649,14 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         llama_batch single = llama_batch_get_one(&id, 1);
         if (llama_decode(session->ctx, single) != 0) {
             LOGE("llama_decode(generated) failed at %d", i);
+            // KV 状态不可信，作废缓存，下次请求走全量 prefill
+            llama_memory_clear(mem, true);
+            session->kv_tokens.clear();
             finish_reason = FINISH_ERROR;
             break;
         }
+        // 生成的 token 也进了 KV，记下来供下次对话复用作前缀
+        session->kv_tokens.push_back(id);
 
         if (i + 1 >= gen_limit) {
             finish_reason = FINISH_LENGTH;
