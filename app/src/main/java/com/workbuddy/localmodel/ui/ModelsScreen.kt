@@ -38,6 +38,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -140,6 +141,22 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.secondary
+                        )
+                        // GPU 回显：这一行是判断 Vulkan 到底有没有生效的唯一依据。
+                        // 只有 .so 里真的注册了 Vulkan 后端，设备列表里才会出现 GPU 设备
+                        val gpu = state.info
+                        Text(
+                            when {
+                                !gpu.gpuOffloadSupported ->
+                                    "GPU：本版未编译 GPU 后端，当前纯 CPU 推理（多线程 + i8mm）"
+                                gpu.gpuActive ->
+                                    "GPU：已卸载 ${gpu.gpuLayersEffective}/${gpu.layerCount} 层" +
+                                        "（请求 ${gpu.gpuLayersRequested}）· ${gpu.gpuDevices}"
+                                else ->
+                                    "GPU：可用（${gpu.gpuDevices}），当前 GPU 层数为 0，未启用 GPU"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (gpu.gpuActive) Color(0xFF2E7D32) else MaterialTheme.colorScheme.secondary
                         )
                     }
 

@@ -37,6 +37,12 @@ object LlamaBridge {
 
     external fun nativeModelSize(handle: Long): Long
 
+    /** GPU 后端实况，JSON 串：offload_supported / n_layer / requested / effective / devices[] */
+    external fun nativeGpuInfo(handle: Long): String
+
+    /** 上一次生成耗时：[prefillMs, decodeMs, generatedTokens] */
+    external fun nativeLastTiming(handle: Long): LongArray
+
     external fun nativeContextSize(handle: Long): Int
 
     external fun nativeHasChatTemplate(handle: Long): Boolean

@@ -4,6 +4,27 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Vulkan 后端的构建开关：cd 到仓库根目录执行 gradle assembleDebug -Pvulkan
+// 打开它需要构建机额外准备：NDK 自带的 glslc、一个 Windows 主机 C++ 编译器
+// （用于编译 vulkan-shaders-gen）、以及 SPIRV-Headers 的 include 目录。
+// 注意：命令行写 -Pvulkan 但不出值时属性值是空串，按"出现即开启"处理
+val vulkanProperty = project.findProperty("vulkan") as String?
+val vulkanEnabled = vulkanProperty != null &&
+    vulkanProperty.lowercase() !in listOf("false", "0", "off", "no")
+val vulkanValue = if (vulkanEnabled) "ON" else "OFF"
+val spirvHeadersDir = (project.findProperty("spirvHeadersDir") as String?)
+    ?: System.getenv("SPIRV_HEADERS_DIR")
+    ?: ""
+// Vulkan-Headers 仓库（提供 C++ 头 vulkan.hpp，NDK 里没有）
+val vulkanHeadersDir = (project.findProperty("vulkanHeadersDir") as String?)
+    ?: System.getenv("VULKAN_HEADERS_DIR")
+    ?: ""
+
+// 只打某一个 ABI 的包：gradle assembleDebug -PabiFilter=arm64-v8a
+// 默认仍然双 ABI（arm64-v8a + x86_64），但编进 Vulkan 后单个 .so 约 32MB，
+// 双 ABI 的 debug 包会到 88MB，发版时用这个开关只出 arm64 版本。
+val abiFilter = (project.findProperty("abiFilter") as String?)?.takeIf { it.isNotBlank() }
+
 android {
     namespace = "com.workbuddy.localmodel"
     compileSdk = 35
@@ -13,13 +34,17 @@ android {
 
     defaultConfig {
         applicationId = "com.workbuddy.localmodel"
-        minSdk = 26
+        // 28 而不是 26：ggml-vulkan 调用了 Vulkan 1.1 的 vkGetPhysicalDeviceFeatures2 等接口，
+        // NDK 的 libvulkan.so 桩库按 API 级别裁剪，API 26/27 只有 Vulkan 1.0 符号。
+        // 若把它们链进来却又在旧设备上跑，dlopen liblocalmodel.so 会因缺符号整体失败
+        // （连纯 CPU 路径一起挂），所以这里直接把下限提到有 1.1 符号的 API 28。
+        minSdk = 28
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 6
+        versionName = "1.0.5"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += if (abiFilter != null) listOf(abiFilter) else listOf("arm64-v8a", "x86_64")
         }
 
         externalNativeBuild {
@@ -41,7 +66,11 @@ android {
                     "-DGGML_CPU_ALL_VARIANTS=OFF",
                     "-DGGML_NATIVE=OFF",
                     "-DGGML_LLAMAFILE=OFF",
-                    "-DGGML_VULKAN=OFF",
+                    // Vulkan 默认关闭；-Pvulkan 打开（需要 NDK glslc + 主机 C++ 编译器生成 shader）
+                    "-DGGML_VULKAN=$vulkanValue",
+                    "-DGGML_VULKAN_ENABLED=$vulkanValue",
+                    "-DSPIRV_HEADERS_DIR=$spirvHeadersDir",
+                    "-DVULKAN_HEADERS_DIR=$vulkanHeadersDir",
                     "-DGGML_OPENCL=OFF",
                     // Debug 变体默认给 C/C++ 传 -O0，llama.cpp 的量化矩阵乘在 -O0 下会慢数倍；
                     // 这里把 Debug 的优化等级拉到 -O3（保留 -g 便于栈回溯）

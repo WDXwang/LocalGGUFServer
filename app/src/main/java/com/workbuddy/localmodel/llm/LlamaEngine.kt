@@ -1,5 +1,7 @@
 package com.workbuddy.localmodel.llm
 
+import android.app.ActivityManager
+import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -7,6 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -20,6 +23,14 @@ object LlamaEngine {
 
     private val generationMutex = Mutex()
     private val freeLock = Any()
+
+    /** 应用 Context，用于加载前查询可用内存 */
+    @Volatile
+    private var appContext: Context? = null
+
+    fun attach(context: Context) {
+        appContext = context.applicationContext
+    }
 
     @Volatile
     private var handle: Long = 0L
@@ -42,6 +53,13 @@ object LlamaEngine {
 
                 _state.value = EngineState.Loading(file.name)
                 try {
+                    // 加载前内存预估：宁可拒绝加载并提示换小模型，也不要让 native 在
+                    // 分配中途 OOM 被杀（后者在真机上表现为"无声闪退"，拿不到任何日志）
+                    memoryShortfall(file, config)?.let { message ->
+                        _state.value = EngineState.Failed(message)
+                        return@withLock Result.failure(IllegalStateException(message))
+                    }
+
                     val h = LlamaBridge.nativeLoadModel(
                         path = file.absolutePath,
                         nThreads = config.threads,
@@ -65,10 +83,18 @@ object LlamaEngine {
                         contextSize = LlamaBridge.nativeContextSize(h),
                         hasChatTemplate = LlamaBridge.nativeHasChatTemplate(h)
                     )
+                    val gpu = parseGpuInfo(LlamaBridge.nativeGpuInfo(h))
+                    val infoWithGpu = loaded.copy(
+                        gpuLayersRequested = gpu.requested,
+                        gpuLayersEffective = gpu.effective,
+                        layerCount = gpu.layers,
+                        gpuOffloadSupported = gpu.offload,
+                        gpuDevices = gpu.devices
+                    )
                     synchronized(freeLock) { handle = h }
-                    info = loaded
-                    _state.value = EngineState.Ready(loaded)
-                    Result.success(loaded)
+                    info = infoWithGpu
+                    _state.value = EngineState.Ready(infoWithGpu)
+                    Result.success(infoWithGpu)
                 } catch (t: Throwable) {
                     val message = t.message ?: t.javaClass.simpleName
                     _state.value = EngineState.Failed(message)
@@ -241,6 +267,11 @@ object LlamaEngine {
             generated = 0
         }
 
+        // 耗时由 native 侧在同一个时钟里量，避免把 JNI/线程切换算进 prefill
+        val timing = runCatching { LlamaBridge.nativeLastTiming(h) }.getOrNull()
+        val prefillMs = timing?.getOrNull(0) ?: 0L
+        val decodeMs = timing?.getOrNull(1) ?: 0L
+
         if (ret < 0) {
             Result.failure(
                 IllegalStateException(
@@ -259,10 +290,85 @@ object LlamaEngine {
                     text = builder.toString(),
                     generatedTokens = generated,
                     finishReason = finishReason,
-                    prefillTokens = prefill
+                    prefillTokens = prefill,
+                    prefillMs = prefillMs,
+                    decodeMs = decodeMs
                 )
             )
         }
+    }
+
+    /**
+     * 加载前内存预估。返回非 null 表示"不够，别加载"，字符串是要给用户看的原因。
+     *
+     * 估算口径（偏保守，目的只是拦住必然 OOM 的情况）：
+     *   权重     = 文件大小 ×（mlock 1.5 / mmap 1.2）——mlock 会把整份权重钉在物理内存，
+     *              另需一段连续空间给计算图张量；mmap 时权重可以按页换入，但要留计算缓冲
+     *   KV cache = n_ctx × 40KB（按 4B 级模型 32 层 / GQA 8 KV 头 / fp16 的典型值）
+     *   固定开销 = 128MB（计算图、tokenizer、采样器、日志缓冲等）
+     */
+    private fun memoryShortfall(file: File, config: LoadConfig): String? {
+        val context = appContext ?: return null
+        val am = context.getSystemService(ActivityManager::class.java) ?: return null
+        val mi = ActivityManager.MemoryInfo()
+        runCatching { am.getMemoryInfo(mi) }.getOrNull() ?: return null
+
+        val fileBytes = file.length()
+        val weightFactor = if (config.useMlock) 1.5 else 1.2
+        val kvBytes = config.contextSize.toLong() * 40_960L
+        val overhead = 128L * 1024 * 1024
+        val need = (fileBytes * weightFactor).toLong() + kvBytes + overhead
+        if (mi.availMem >= need) return null
+
+        fun gb(v: Long) = String.format("%.1f", v / 1024.0 / 1024.0 / 1024.0)
+        android.util.Log.w(
+            "LlamaJNI",
+            "memory precheck failed: avail=${gb(mi.availMem)}GB need=${gb(need)}GB " +
+                "(file=${gb(fileBytes)}GB ctx=${config.contextSize} mlock=${config.useMlock})"
+        )
+        return "可用内存不足：需要约 ${gb(need)}GB，当前仅剩 ${gb(mi.availMem)}GB。" +
+            "请换更小的量化版本（Q4_K_M → Q3_K_M / Q2_K），或把上下文调小、关闭 mlock 后重试。"
+    }
+
+    private data class GpuState(
+        val offload: Boolean,
+        val layers: Int,
+        val requested: Int,
+        val effective: Int,
+        val devices: String
+    )
+
+    /**
+     * 解析 native 侧的 GPU 实况 JSON。
+     * devices 拼成 "GPU:Vulkan0 Mali-G720 | CPU:CPU" 这种短串直接给 UI 显示，
+     * 只要 Vulkan 设备出现在列表里，就说明这个 .so 真的带了 Vulkan 后端。
+     */
+    private fun parseGpuInfo(json: String): GpuState {
+        if (json.isBlank()) return GpuState(false, 0, 0, 0, "")
+        return runCatching {
+            val obj = JSONObject(json)
+            val layers = obj.optInt("n_layer", 0)
+            val arr = obj.optJSONArray("devices")
+            val names = buildList {
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val d = arr.optJSONObject(i) ?: continue
+                        val type = d.optString("type", "?")
+                        val name = d.optString("name", "")
+                        val desc = d.optString("desc", "")
+                        val label = listOf(name, desc).filter { it.isNotBlank() }.joinToString(" ")
+                        add("$type:$label")
+                    }
+                }
+            }
+            GpuState(
+                offload = obj.optInt("offload_supported", 0) == 1,
+                layers = layers,
+                requested = obj.optInt("requested", 0),
+                effective = obj.optInt("effective", 0),
+                devices = names.joinToString(" | ")
+            )
+        }.getOrElse { GpuState(false, 0, 0, 0, "") }
     }
 
     private fun releaseLocked() {

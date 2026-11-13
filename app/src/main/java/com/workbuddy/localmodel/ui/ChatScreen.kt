@@ -31,6 +31,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -40,6 +41,7 @@ import com.workbuddy.localmodel.llm.ChatMessage
 import com.workbuddy.localmodel.llm.EngineState
 import com.workbuddy.localmodel.llm.GenParams
 import com.workbuddy.localmodel.llm.LlamaEngine
+import com.workbuddy.localmodel.util.ThermalMonitor
 
 @Composable
 fun ChatScreen(modifier: Modifier = Modifier) {
@@ -50,6 +52,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     val generating by ChatStore.generating.collectAsStateWithLifecycle()
     val error by ChatStore.error.collectAsStateWithLifecycle()
     val notice by ChatStore.notice.collectAsStateWithLifecycle()
+    val perf by ChatStore.perf.collectAsStateWithLifecycle()
 
     var input by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -202,14 +205,36 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 
         Row(
             modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                "上下文 ${messages.size} 条消息",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.secondary,
-                modifier = Modifier.weight(1f)
-            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "上下文 ${messages.size} 条消息",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+                perf?.let { p ->
+                    // 性能行：生成速度 / 首 token 延迟 / 热状态。
+                    // 速度按 15 t/s、8 t/s 两档上色，一眼能看出当前是不是被温控压着了
+                    val speedColor = when {
+                        p.tokensPerSecond >= 15 -> Color(0xFF2E7D32)
+                        p.tokensPerSecond >= 8 -> Color(0xFFF9A825)
+                        else -> MaterialTheme.colorScheme.error
+                    }
+                    Text(
+                        String.format(
+                            "%.1f t/s · 首字 %.1fs · %d tokens · 温度 %s",
+                            p.tokensPerSecond,
+                            p.ttftMs / 1000.0,
+                            p.generated,
+                            ThermalMonitor.labelOf(p.thermalLevel)
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = speedColor
+                    )
+                }
+            }
             TextButton(onClick = { ChatStore.clear() }, enabled = !generating) {
                 Text("清空对话")
             }

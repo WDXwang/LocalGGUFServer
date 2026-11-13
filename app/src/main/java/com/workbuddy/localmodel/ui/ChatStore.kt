@@ -3,6 +3,7 @@ package com.workbuddy.localmodel.ui
 import com.workbuddy.localmodel.llm.ChatMessage
 import com.workbuddy.localmodel.llm.GenParams
 import com.workbuddy.localmodel.llm.LlamaEngine
+import com.workbuddy.localmodel.util.ThermalMonitor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -35,6 +36,17 @@ object ChatStore {
     private val _notice = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
+    /** 上一轮生成的速度指标，供聊天页底部性能行显示 */
+    private val _perf = MutableStateFlow<PerfSnapshot?>(null)
+    val perf: StateFlow<PerfSnapshot?> = _perf.asStateFlow()
+
+    data class PerfSnapshot(
+        val tokensPerSecond: Double,
+        val ttftMs: Long,
+        val generated: Int,
+        val thermalLevel: Int
+    )
+
     /**
      * 对话世代号。切换模型时自增，让在途生成的结果失效，
      * 避免旧模型的回答被追加到已经清空的对话里。
@@ -52,12 +64,26 @@ object ChatStore {
         _streaming.value = ""
         _generating.value = true
 
+        // 温控降级：偏热时把单次生成长度砍半（少跑一会儿、少发热），
+        // 严重过热时直接不启动，避免把 SoC 顶到关机保护
+        val thermal = ThermalMonitor.status.value
+        if (thermal >= 4) {
+            _generating.value = false
+            _error.value = "设备温度过高（${ThermalMonitor.label}），已暂停推理。请让手机降温后再试。"
+            return
+        }
+        val effectiveParams = if (thermal >= 2) {
+            params.copy(maxTokens = (params.maxTokens / 2).coerceAtLeast(64))
+        } else {
+            params
+        }
+
         val snapshot = _messages.value
         val myEpoch = epoch
         scope.launch {
             val result = LlamaEngine.chat(
                 snapshot,
-                params,
+                effectiveParams,
                 onToken = { chunk ->
                     if (myEpoch == epoch) {
                         _streaming.update { it + chunk }
@@ -75,6 +101,14 @@ object ChatStore {
             }
             result.onSuccess { gen ->
                 _messages.update { it + ChatMessage("assistant", gen.text) }
+                if (gen.generatedTokens > 0) {
+                    _perf.value = PerfSnapshot(
+                        tokensPerSecond = gen.tokensPerSecond,
+                        ttftMs = gen.ttftMs,
+                        generated = gen.generatedTokens,
+                        thermalLevel = ThermalMonitor.status.value
+                    )
+                }
             }.onFailure { throwable ->
                 _error.value = throwable.message ?: "推理失败"
             }

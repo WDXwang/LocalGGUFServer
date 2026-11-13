@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #define LOG_TAG "LlamaJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -32,7 +34,32 @@ struct LlamaSession {
     // 下次请求若 prompt 与它有公共前缀，只需 decode 新增的那一段，不必整段重新 prefill。
     // 仅在持有 gen_mutex 时访问。
     std::vector<llama_token> kv_tokens;
+
+    // 上一次生成的耗时，供 Kotlin 侧算 t/s 与 TTFT。
+    // prefill_ms 从开始 decode prompt 算到 prompt 处理完（≈首 token 延迟），
+    // gen_ms 从 prompt 处理完算到最后一个 token，两者都不含 UI 侧开销。
+    std::atomic<long long> last_prefill_ms{0};
+    std::atomic<long long> last_gen_ms{0};
+    std::atomic<int>       last_generated{0};
+
+    // 加载时请求的 GPU 层数，用于和实际生效值一起回显
+    int32_t requested_gpu_layers = 0;
 };
+
+long long now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+const char *backend_dev_type_name(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   return "GPU";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "ACCEL";
+        default:                             return "?";
+    }
+}
+
 
 enum FinishReason {
     FINISH_STOP      = 0,
@@ -284,6 +311,7 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
     }
 
     auto *session = new LlamaSession();
+    session->requested_gpu_layers = n_gpu_layers;
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
@@ -331,9 +359,12 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
         session->chat_template = tmpl;
     }
 
-    LOGI("model loaded: %s (ctx=%u, threads=%d, batch=%u, mlock=%d, mlock_supported=%d)",
+    LOGI("model loaded: %s (ctx=%u, threads=%d, batch=%u, mlock=%d, mlock_supported=%d, "
+         "gpu_offload_supported=%d, gpu_layers=%d, n_layer=%d)",
          model_path.c_str(), llama_n_ctx(session->ctx), cparams.n_threads,
-         cparams.n_batch, mlock_in_use ? 1 : 0, llama_supports_mlock() ? 1 : 0);
+         cparams.n_batch, mlock_in_use ? 1 : 0, llama_supports_mlock() ? 1 : 0,
+         llama_supports_gpu_offload() ? 1 : 0, n_gpu_layers,
+         llama_model_n_layer(session->model));
     return reinterpret_cast<jlong>(session);
 }
 
@@ -387,10 +418,93 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeModelSize(JNIEnv * /*env*/, 
     return static_cast<jlong>(llama_model_size(session->model));
 }
 
+/**
+ * GPU 后端实况：注册到的 device 名单 + 模型层数 + 请求的卸载层数。
+ *
+ * 这一版 llama.cpp 没有 llama_model_n_gpu_layers()，无法直接读回"实际卸载了几层"，
+ * 所以这里给的是可验证的等价信息：后端是否真的注册成功（Vulkan device 出现在列表里）、
+ * 设备的真实名字（Mali-G720）、模型总层数、请求值。
+ * 三者一起看就能判断 -Pvulkan 到底有没有生效，而不是只看构建成功。
+ * 返回 JSON 串，Kotlin 侧解析后直接显示。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGpuInfo(JNIEnv *env, jobject /*thiz*/,
+                                                            jlong handle) {
+    auto *session = reinterpret_cast<LlamaSession *>(handle);
+    if (session == nullptr || session->model == nullptr) {
+        return utf8_to_jstring(env, "{}");
+    }
+
+    const int32_t n_layer = llama_model_n_layer(session->model);
+    const bool offload = llama_supports_gpu_offload();
+    const size_t n_dev = ggml_backend_dev_count();
+    // 负值表示"全部层"，回显时按总层数折算成实际生效上限
+    int32_t effective = session->requested_gpu_layers;
+    if (effective < 0) {
+        effective = n_layer;
+    } else if (effective > n_layer) {
+        effective = n_layer;
+    }
+
+    std::string out = "{";
+    out += "\"offload_supported\":" + std::to_string(offload ? 1 : 0);
+    out += ",\"n_layer\":" + std::to_string(n_layer);
+    out += ",\"requested\":" + std::to_string(session->requested_gpu_layers);
+    out += ",\"effective\":" + std::to_string(effective);
+    out += ",\"devices\":[";
+    for (size_t i = 0; i < n_dev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (dev == nullptr) {
+            continue;
+        }
+        if (i > 0) {
+            out += ",";
+        }
+        std::string name = ggml_backend_dev_name(dev);
+        std::string desc = ggml_backend_dev_description(dev);
+        // 手写转义，名字里出现引号/反斜杠的概率极低但别让 JSON 坏掉
+        auto esc = [](const std::string &s) {
+            std::string r;
+            for (char c : s) {
+                if (c == '"' || c == '\\') r.push_back('\\');
+                r.push_back(c);
+            }
+            return r;
+        };
+        out += "{\"type\":\"" + std::string(backend_dev_type_name(ggml_backend_dev_type(dev))) + "\"";
+        out += ",\"name\":\"" + esc(name) + "\"";
+        out += ",\"desc\":\"" + esc(desc) + "\"}";
+    }
+    out += "]}";
+
+    LOGI("gpu info: %s", out.c_str());
+    return utf8_to_jstring(env, out);
+}
+
+/**
+ * 上一次生成的耗时（毫秒）：返回 [prefill_ms, gen_ms, generated_tokens]。
+ * 有了它 Kotlin 侧才能算 t/s 与 TTFT，而不是只能看日志。
+ */
+JNIEXPORT jlongArray JNICALL
+Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLastTiming(JNIEnv *env, jobject /*thiz*/,
+                                                              jlong handle) {
+    auto *session = reinterpret_cast<LlamaSession *>(handle);
+    jlong values[3] = {0, 0, 0};
+    if (session != nullptr) {
+        values[0] = session->last_prefill_ms.load();
+        values[1] = session->last_gen_ms.load();
+        values[2] = session->last_generated.load();
+    }
+    jlongArray arr = env->NewLongArray(3);
+    if (arr != nullptr) {
+        env->SetLongArrayRegion(arr, 0, 3, values);
+    }
+    return arr;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeContextSize(JNIEnv * /*env*/, jobject /*thiz*/,
-                                                               jlong handle) {
-    auto *session = reinterpret_cast<LlamaSession *>(handle);
+                                                               jlong handle) {    auto *session = reinterpret_cast<LlamaSession *>(handle);
     if (session == nullptr || session->ctx == nullptr) {
         return 0;
     }
@@ -581,6 +695,7 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
     }
 
     // 4. 只 decode 公共前缀之后的部分（首次请求时 reuse == 0，等于全量 prefill）
+    const long long t_prefill_start = now_ms();
     const uint32_t n_batch = llama_n_batch(session->ctx);
     for (int32_t i = reuse; i < n_tokens; i += static_cast<int32_t>(n_batch)) {
         if (session->stop.load()) {
@@ -600,6 +715,8 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         session->kv_tokens.insert(session->kv_tokens.end(),
                                   tokens.begin() + i, tokens.begin() + i + chunk);
     }
+    // prefill 结束 ≈ 首 token 延迟（TTFT）里可控的那一段
+    const long long t_prefill_end = now_ms();
 
     // 5. sampler
     llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
@@ -683,10 +800,22 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
     }
     llama_sampler_free(smpl);
 
+    // 生成阶段耗时：从 prefill 结束到最后一个 token，不含首 token 等待，
+    // 这样 t/s 才是 decode 速度，不会被长 prompt 的 prefill 拉低
+    const long long t_end = now_ms();
+    const long long prefill_ms = t_prefill_end - t_prefill_start;
+    const long long gen_ms = t_end - t_prefill_end;
+    session->last_prefill_ms.store(prefill_ms);
+    session->last_gen_ms.store(gen_ms);
+    session->last_generated.store(generated);
+
+    const double tps = gen_ms > 0 ? (static_cast<double>(generated) * 1000.0 / gen_ms) : 0.0;
+
     // 供 adb logcat -s LlamaJNI 观察 KV 增长趋势，判断是否被上下文上限卡住
-    LOGI("generate done: finish=%d, generated=%d, kv_tokens=%zu, n_ctx=%u",
+    LOGI("generate done: finish=%d, generated=%d, kv_tokens=%zu, n_ctx=%u, "
+         "prefill=%lldms, decode=%lldms, tps=%.2f",
          finish_reason, generated, session->kv_tokens.size(),
-         llama_n_ctx(session->ctx));
+         llama_n_ctx(session->ctx), prefill_ms, gen_ms, tps);
 
     finish(finish_reason, generated);
     return generated;

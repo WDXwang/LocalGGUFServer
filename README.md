@@ -4,14 +4,18 @@
 
 ## 下载
 
-- 最新版 APK：[`releases/LocalGGUFServer-1.0.4-debug-D9300.apk`](releases/LocalGGUFServer-1.0.4-debug-D9300.apk)
+- 最新版 APK：[`releases/LocalGGUFServer-1.0.5-debug-D9300.apk`](releases/LocalGGUFServer-1.0.5-debug-D9300.apk)
 - 历史版本：[GitHub Releases](https://github.com/WDXwang/LocalGGUFServer/releases)
 
 约定：仓库 `releases/` 只保留当前最新一个 APK，历史版本放 Releases 附件，避免 git 历史随每个版本线性膨胀。发版流程见 [`releases/README.md`](releases/README.md)。
 
 ## 功能
 
-- **本地推理**：内置 llama.cpp（JNI），纯 CPU 推理，无需联网。
+- **本地推理**：内置 llama.cpp（JNI），无需联网。
+- **GPU 加速（可选）**：编译期打开 `-Pvulkan` 后启用 ggml 的 Vulkan 后端，可把模型层卸载到 Mali/Adreno GPU；未打开时为纯 CPU 推理。加载后可在「模型」页读回实际生效的卸载层数。
+- **性能可见**：聊天页底部显示 t/s、首字延迟（TTFT）、生成 token 数、设备热状态。
+- **加载前内存预估**：可用内存不足时直接拒绝加载并提示换更小量化版本，避免 native OOM 闪退。
+- **温控降级**：监听 `PowerManager` 热状态，过热时自动缩减生成长度、严重时拒绝启动。
 - **GGUF 导入**：通过系统文件选择器导入 `.gguf` 模型，文件复制到应用私有目录。
 - **对话界面**：Compose 聊天页，支持流式输出与中途停止。
 - **OpenAI 兼容 API**：
@@ -74,8 +78,10 @@ LocalGGUFServer/
 | Android SDK | compileSdk / targetSdk 35 |
 | NDK | `27.2.12479018` |
 | CMake | `3.22.1` |
-| 最低系统 | Android 8.0（API 26） |
-| ABI | arm64-v8a、x86_64 |
+| 最低系统 | Android 9（API 28） |
+| ABI | arm64-v8a、x86_64（发版包只打 arm64-v8a） |
+
+> 最低系统是 API 28 的原因：ggml 的 Vulkan 后端调用 Vulkan 1.1 接口（如 `vkGetPhysicalDeviceFeatures2`），而 NDK 的 `libvulkan.so` 桩库在 API 26/27 上只有 Vulkan 1.0 符号，链接或运行都会失败。
 
 ## 构建
 
@@ -110,6 +116,51 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 > 首次 Gradle Sync 会下载 AGP、Compose 等依赖，需要网络。
 > `app/src/main/cpp/llama.cpp/` 已加入 `.gitignore`，不会入库。
+
+### 打开 GPU（Vulkan）后端
+
+默认构建 **不含** Vulkan 后端。要打开，需要额外准备三样东西：
+
+| 依赖 | 用途 |
+| --- | --- |
+| NDK 自带的 `shader-tools/<host>/glslc` | 编译 156 个 GLSL 计算着色器（NDK 里已有，无需安装 Vulkan SDK） |
+| 主机 C++ 编译器（Windows 可用 MinGW-w64 的 `gcc.exe`） | 构建期工具 `vulkan-shaders-gen` |
+| [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) 与 [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | 提供 `spirv/unified1/spirv.hpp` 与 C++ 的 `vulkan.hpp`（NDK sysroot 只有 C 头） |
+
+```bash
+# SPIRV_HEADERS_DIR / VULKAN_HEADERS_DIR 指向两个仓库的根目录
+SPIRV_HEADERS_DIR=/path/to/SPIRV-Headers \
+VULKAN_HEADERS_DIR=/path/to/Vulkan-Headers \
+./gradlew assembleDebug -Pvulkan \
+  -PspirvHeadersDir=/path/to/SPIRV-Headers \
+  -PvulkanHeadersDir=/path/to/Vulkan-Headers
+```
+
+Windows（`PATH` 里要先有 `gcc.exe`）：
+
+```powershell
+$env:SPIRV_HEADERS_DIR="C:\AndroidBuild\spirv-src"
+$env:VULKAN_HEADERS_DIR="C:\AndroidBuild\vulkan-headers"
+$env:PATH="C:\AndroidBuild\mingw64\mingw64\bin;$env:PATH"
+gradlew.bat assembleDebug -Pvulkan `
+  -PspirvHeadersDir="$env:SPIRV_HEADERS_DIR" `
+  -PvulkanHeadersDir="$env:VULKAN_HEADERS_DIR"
+```
+
+说明：
+
+- `-Pvulkan` 不带值也算开启（命令行空串按"出现即开启"处理）。
+- `app/src/main/cpp/cmake/FindVulkan.cmake` 与 `cmake/spirv/SPIRV-HeadersConfig.cmake` 是为"机器上没有 Vulkan SDK 也能编"写的兜底：前者从 NDK 里找头、桩库与 glslc，后者把 SPIRV-Headers 的最小 CONFIG 包补出来。
+- 上游 `ggml-vulkan` 只 `find_package(SPIRV-Headers)` 却没把 include 挂到目标上，`app/src/main/cpp/CMakeLists.txt` 里补了这一条，否则会报 `spirv/unified1/spirv.hpp file not found`。
+- 首次构建要跑 156 次 `glslc`，耗时明显长于纯 CPU 构建；16GB 机器建议 `CMAKE_BUILD_PARALLEL_LEVEL=1`，否则 `ggml-vulkan.cpp` 与 `llama-model.cpp` 同时编译容易 OOM。
+- 只想出手机上用的包可加 `-PabiFilter=arm64-v8a`：Vulkan 让单个 `.so` 涨到 32MB，双 ABI 的 debug 包会到 88MB。
+
+验证后端确实编进去了：
+
+```bash
+unzip -p app/build/outputs/apk/debug/app-debug.apk lib/arm64-v8a/liblocalmodel.so > /tmp/l.so
+llvm-strings /tmp/l.so | grep -m3 'ggml_vulkan'
+```
 
 ## 使用
 
