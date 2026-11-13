@@ -221,6 +221,36 @@ object LlamaEngine {
         }
     }
 
+    /**
+     * 加载后预热：产 1 个 token 的空推理。
+     *
+     * Vulkan 的第一轮推理要现编/加载 compute pipeline、分配 compute buffer、建图，
+     * 这部分开销在真机上表现为"第一次回答明显比后面慢"（实测 32 层首轮 prefill
+     * 2265ms，第二轮只有 245ms）。预热把它提前吃掉，用户感知到的第一条回复就快了。
+     */
+    suspend fun warmup(): Result<Long> = generationMutex.withLock {
+        val h = handle
+        if (h == 0L) {
+            return@withLock Result.failure(IllegalStateException("尚未加载模型"))
+        }
+        try {
+            val t0 = System.currentTimeMillis()
+            val result = generateLocked(
+                h,
+                "hi",
+                GenParams(maxTokens = 1, temperature = 0f, seed = 0),
+                {}
+            )
+            val cost = System.currentTimeMillis() - t0
+            result.fold(
+                onSuccess = { Result.success(cost) },
+                onFailure = { Result.failure(it) }
+            )
+        } catch (t: Throwable) {
+            Result.failure(t)
+        }
+    }
+
     suspend fun countTokens(text: String): Int = withContext(Dispatchers.Default) {
         val h = handle
         if (h == 0L) 0 else LlamaBridge.nativeCountTokens(h, text)

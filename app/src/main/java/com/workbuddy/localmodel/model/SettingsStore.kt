@@ -8,14 +8,32 @@ class SettingsStore(context: Context) {
     private val prefs = context.getSharedPreferences("local_model_settings", Context.MODE_PRIVATE)
 
     /**
-     * 默认上下文 4096。
+     * 默认上下文 8192。
      *
-     * 8192 在手机上 prefill 慢、KV 缓存占用近乎翻倍，长时间多轮对话更容易被系统回收；
-     * 需要长上下文时在「加载参数」卡片里手动调大，并配合自动裁剪使用。
+     * 4096 时自动裁剪只留 2764 token（要扣掉 max_tokens 与余量），一问一答就把历史丢光，
+     * 于是每轮都 kv_reset 全量重算 —— 真机上这正是 prefill 动辄几十秒的主因。
+     * 8192 后可用预算约 7000 token，多轮对话能留住历史、KV 复用才真正生效；
+     * 4B Q4_K_M 在 16GB 机型上 KV 缓存只多占几百 MB，代价可接受。
+     * 小内存机型仍可在「加载参数」里调回 4096。
      */
     var contextSize: Int
-        get() = prefs.getInt(KEY_CONTEXT, 4096)
+        get() = prefs.getInt(KEY_CONTEXT, DEFAULT_CONTEXT)
         set(value) = prefs.edit().putInt(KEY_CONTEXT, value).apply()
+
+    /**
+     * 老版本留下的 4096 默认值升级到 8192。
+     *
+     * 只在用户没手动改过（值仍是旧默认 4096）时迁移一次，迁移后置位标记，
+     * 之后用户自己改回 4096 不会再被覆盖。
+     */
+    fun migrateContextDefaultIfNeeded() {
+        if (prefs.getBoolean(KEY_CONTEXT_MIGRATED, false)) return
+        val edited = prefs.edit()
+        if (prefs.getInt(KEY_CONTEXT, DEFAULT_CONTEXT) == LEGACY_DEFAULT_CONTEXT) {
+            edited.putInt(KEY_CONTEXT, DEFAULT_CONTEXT)
+        }
+        edited.putBoolean(KEY_CONTEXT_MIGRATED, true).apply()
+    }
 
     var threads: Int
         get() = prefs.getInt(KEY_THREADS, defaultThreads())
@@ -118,6 +136,9 @@ class SettingsStore(context: Context) {
         set(value) = prefs.edit().putString(KEY_LAST_MODEL, value).apply()
 
     private companion object {
+        const val DEFAULT_CONTEXT = 8192
+        const val LEGACY_DEFAULT_CONTEXT = 4096
+        const val KEY_CONTEXT_MIGRATED = "context_default_migrated"
         const val KEY_CONTEXT = "context_size"
         const val KEY_THREADS = "threads"
         const val KEY_BATCH = "batch_size"

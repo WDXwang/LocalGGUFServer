@@ -6,7 +6,7 @@ data class ChatMessage(
 )
 
 data class LoadConfig(
-    val contextSize: Int = 4096,
+    val contextSize: Int = 8192,
     val threads: Int = Runtime.getRuntime().availableProcessors().coerceIn(2, 8),
     val batchSize: Int = 256,
     val gpuLayers: Int = 0,

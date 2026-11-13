@@ -182,7 +182,7 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                                 return@Button
                             }
                             val config = LoadConfig(
-                                contextSize = contextText.toIntOrNull()?.coerceIn(512, 131072) ?: 4096,
+                                contextSize = contextText.toIntOrNull()?.coerceIn(512, 131072) ?: 8192,
                                 threads = threadText.toIntOrNull()?.coerceIn(1, 32) ?: settings.threads,
                                 batchSize = batchText.toIntOrNull()?.coerceIn(32, 2048) ?: 256,
                                 gpuLayers = gpuText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
@@ -229,6 +229,15 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                                             note += "，已套用预设「${p.name}」"
                                         }
                                         message = note
+                                        // 预热：加载后立刻跑一次 1 token 的空推理，
+                                        // 把 Vulkan 首轮的 pipeline 编译 / 建图开销提前吃掉，
+                                        // 用户感知到的第一句话就不会慢得离谱
+                                        val warm = LlamaEngine.warmup()
+                                        warm.onSuccess { cost ->
+                                            message = "$note，已预热 ${cost}ms"
+                                        }.onFailure { error ->
+                                            message = "$note（预热失败：${error.message ?: "未知错误"}）"
+                                        }
                                     }
                                     .onFailure { message = it.message }
                             }
@@ -345,7 +354,7 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                 }
                 Text(
                     "提示：上下文越大越占内存，Batch 越大 prefill 越快但内存峰值和发热也越高。" +
-                        "7B 建议 上下文 4096 / Batch 256 / 线程 4；" +
+                        "默认上下文 8192（4096 时自动裁剪只留约 3700 token，一轮就把历史丢光、每轮全量重算）；" +
                         "GPU 层数建议直接点「自动推荐」用全量卸载——真机实测（Qwen3.5-4B / Mali-G720）" +
                         "0 层 2.7 t/s、16 层 3.0、24 层 3.5、全量 32 层 6.0 t/s，prefill 也从 9.4s 降到 2.3s。",
                     style = MaterialTheme.typography.bodySmall,

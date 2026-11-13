@@ -18,6 +18,9 @@ class LocalModelApp : Application() {
         super.onCreate()
         modelRepository = ModelRepository(this)
         settings = SettingsStore(this)
+        // 老版本默认 4096 迁移到 8192：ctx 太小时自动裁剪会把历史压到几千 token，
+        // 每轮都全量重算 prefill，这是真机上几十秒延迟的主因
+        settings.migrateContextDefaultIfNeeded()
         LlamaEngine.attach(this)
         // 温控监听挂在 Application 上：进程活多久就监听多久，
         // 不依赖某个页面是否在前台
