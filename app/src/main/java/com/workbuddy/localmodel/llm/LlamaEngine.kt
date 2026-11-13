@@ -2,6 +2,7 @@ package com.workbuddy.localmodel.llm
 
 import android.app.ActivityManager
 import android.content.Context
+import com.workbuddy.localmodel.model.SettingsStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -51,8 +52,34 @@ object LlamaEngine {
     @Volatile
     private var appContext: Context? = null
 
+    /** 设置项，读取"思考模式"开关；UI 聊天和 HTTP 接口都走这里，保持同一份策略 */
+    @Volatile
+    private var settings: SettingsStore? = null
+
     fun attach(context: Context) {
         appContext = context.applicationContext
+        settings = SettingsStore(context.applicationContext)
+    }
+
+    /**
+     * 关闭推理（think）时，在 assistant 开头预填一个空的思考块。
+     *
+     * Qwen3/Qwen3.5 系列在 assistant 回复里默认先输出 `<think>...<｜end▁of▁thinking｜>`，
+     * 这段既进不了正文，又要实打实生成一遍 token —— 真机 1~4 t/s 的速度下，
+     * 一段和正文一样长的思考内容等于凭空多等一倍时间。
+     *
+     * 直接把 `<think>\n\n<｜end▁of▁thinking｜>\n` 塞进 prompt 的 assistant 位置，模型会接着写正文，
+     * 不需要它自己再走一遍思考。只在模型名命中 qwen3 家族时启用，
+     * 其它模型没有这个约定，硬塞会污染上下文。
+     */
+    private const val THINK_PREFILL = "<think>\n\n</think>\n"
+
+    private fun applyThinkPrefill(prompt: String): String {
+        if (settings?.thinkMode ?: true) return prompt
+        val name = info?.name?.lowercase() ?: return prompt
+        if (!name.contains("qwen3")) return prompt
+        android.util.Log.i("LlamaJNI", "think prefill: 已关闭思考，跳过 <think> 推理段")
+        return prompt + THINK_PREFILL
     }
 
     @Volatile
@@ -168,6 +195,8 @@ object LlamaEngine {
                 effective.map { it.content }.toTypedArray(),
                 true
             )
+            // 关闭思考时把空的 <think> 块预填进去，模型直接写正文，省掉一整段推理 token
+            prompt = applyThinkPrefill(prompt)
 
             // 上下文保护：两个预算取更严的那个
             //   1) 模型上限：n_ctx 的 80% 再预留生成长度（硬限制，超了 native 会截断）
@@ -189,12 +218,12 @@ object LlamaEngine {
                     if (next.size == effective.size) break
                     dropped += effective.size - next.size
                     effective = next
-                    prompt = LlamaBridge.nativeBuildPrompt(
+                    prompt = applyThinkPrefill(LlamaBridge.nativeBuildPrompt(
                         h,
                         effective.map { it.role }.toTypedArray(),
                         effective.map { it.content }.toTypedArray(),
                         true
-                    )
+                    ))
                     promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
                 }
                 if (dropped > 0) {

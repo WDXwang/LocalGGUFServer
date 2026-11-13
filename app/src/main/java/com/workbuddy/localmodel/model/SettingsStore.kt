@@ -97,6 +97,18 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt(KEY_LAST_LAYER_COUNT, 0)
         set(value) = prefs.edit().putInt(KEY_LAST_LAYER_COUNT, value).apply()
 
+    /**
+     * 思考模式（Qwen3/Qwen3.5 的 <think> 推理段），默认关闭。
+     *
+     * 关闭后 App 会在 assistant 开头预填一个空的 <think></think>，模型直接写正文。
+     * 实测这段思考和正文长度相当，1~4 t/s 的机器上等于凭空多等一倍 ——
+     * 写方案、商务文档这类长输出任务应该关掉；只有需要模型"先想清楚"的
+     * 复杂推理/算题场景才值得打开。
+     */
+    var thinkMode: Boolean
+        get() = prefs.getBoolean(KEY_THINK_MODE, false)
+        set(value) = prefs.edit().putBoolean(KEY_THINK_MODE, value).apply()
+
     var port: Int
         get() = prefs.getInt(KEY_PORT, 8080)
         set(value) = prefs.edit().putInt(KEY_PORT, value).apply()
@@ -154,5 +166,6 @@ class SettingsStore(context: Context) {
         const val KEY_SYSTEM_PROMPT = "system_prompt"
         const val KEY_PRESET_NAME = "preset_name"
         const val KEY_LAST_MODEL = "last_model"
+        const val KEY_THINK_MODE = "think_mode"
     }
 }

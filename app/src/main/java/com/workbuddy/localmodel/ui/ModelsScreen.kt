@@ -67,6 +67,7 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
     var batchText by rememberSaveable { mutableStateOf(settings.batchSize.toString()) }
     var gpuText by rememberSaveable { mutableStateOf(settings.gpuLayers.toString()) }
     var mlockOn by rememberSaveable { mutableStateOf(settings.useMlock) }
+    var thinkOn by rememberSaveable { mutableStateOf(settings.thinkMode) }
     var importing by remember { mutableStateOf(false) }
     var importProgress by remember { mutableFloatStateOf(0f) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -349,6 +350,24 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                         onCheckedChange = {
                             mlockOn = it
                             settings.useMlock = it
+                        }
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("思考模式 (think)", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "开着时模型会先写一大段 <think> 推理再答，这段不进正文但要多等同样长的时间。" +
+                                "写方案、商务文档建议关闭；算题、复杂推理再打开。仅对 Qwen3 系列生效。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                    Switch(
+                        checked = thinkOn,
+                        onCheckedChange = {
+                            thinkOn = it
+                            settings.thinkMode = it
                         }
                     )
                 }
