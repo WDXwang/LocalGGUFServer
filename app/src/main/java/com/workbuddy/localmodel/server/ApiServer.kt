@@ -251,11 +251,15 @@ class ApiServer(
         scope.launch {
             try {
                 queue.push(sse(chatChunk(id, created, null, null, roleOnly = true)))
-                val result = LlamaEngine.chat(messages, params) { text ->
+                // 注意：必须用具名参数写 onToken。
+                // chat() 有 4 个参数（结尾是 onNotice），尾部 lambda 会绑到最后一个参数上，
+                // 写成 chat(messages, params) { text -> ... } 实际是把 text 当"提示"回调，
+                // onToken 仍是默认空实现 —— 表现就是流式只回 role 和 finish，正文一个字都没有。
+                val result = LlamaEngine.chat(messages, params, onToken = { text ->
                     if (!queue.isClosed) {
                         queue.push(sse(chatChunk(id, created, text, null)))
                     }
-                }
+                })
                 result.fold(
                     onSuccess = { gen ->
                         queue.push(sse(chatChunk(id, created, null, finishReason(gen))))
