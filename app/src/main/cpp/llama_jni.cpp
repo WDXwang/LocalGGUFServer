@@ -22,6 +22,33 @@ namespace {
 
 JavaVM *g_vm = nullptr;
 
+/**
+ * 带异常兜底的 llama_decode。
+ *
+ * ggml-vulkan 在设备挂起/驱动超时时会抛 C++ 异常（实测 4000 token 长 prompt 在烫机上
+ * 触发 `vk::SystemError: vk::Queue::submit: Timeout`）。JNI 线程里没人接这个异常就是
+ * std::terminate -> SIGABRT，整个进程闪退，HTTP 连接被直接掐断（curl 看到 Empty reply）。
+ * 收成错误码交给上层按"这一轮失败"处理，至少不会连累进程。
+ *
+ * 返回：0 成功；-1 其它异常；-2 队列提交超时（context 已不可再用）
+ */
+int32_t decode_guarded(llama_context *ctx, llama_batch batch) {
+    try {
+        return llama_decode(ctx, batch);
+    } catch (const std::exception &e) {
+        const std::string what = e.what();
+        LOGE("llama_decode threw: %s", what.c_str());
+        if (what.find("Timeout") != std::string::npos ||
+            what.find("timeout") != std::string::npos) {
+            return -2;
+        }
+        return -1;
+    } catch (...) {
+        LOGE("llama_decode threw unknown exception");
+        return -1;
+    }
+}
+
 struct LlamaSession {
     llama_model       *model  = nullptr;
     llama_context     *ctx    = nullptr;
@@ -719,8 +746,14 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         }
         const int32_t chunk = std::min<int32_t>(static_cast<int32_t>(n_batch), n_tokens - i);
         llama_batch batch = llama_batch_get_one(tokens.data() + i, chunk);
-        if (llama_decode(session->ctx, batch) != 0) {
-            LOGE("llama_decode(prompt) failed at %d", i);
+        const int32_t dec = decode_guarded(session->ctx, batch);
+        if (dec != 0) {
+            LOGE("llama_decode(prompt) failed at %d (code=%d)", i, dec);
+            if (dec == -2) {
+                // Vulkan 提交超时：驱动已经不响应，context 不可再用
+                finish(FINISH_ERROR, 0);
+                return -6;
+            }
             // decode 失败后 KV 状态不可信，作废缓存
             llama_memory_clear(mem, true);
             session->kv_tokens.clear();
@@ -794,8 +827,14 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         ++generated;
 
         llama_batch single = llama_batch_get_one(&id, 1);
-        if (llama_decode(session->ctx, single) != 0) {
-            LOGE("llama_decode(generated) failed at %d", i);
+        const int32_t dec = decode_guarded(session->ctx, single);
+        if (dec != 0) {
+            LOGE("llama_decode(generated) failed at %d (code=%d)", i, dec);
+            if (dec == -2) {
+                // Vulkan 提交超时，context 不可再用，直接结束（不自杀进程）
+                finish_reason = FINISH_ERROR;
+                break;
+            }
             // KV 状态不可信，作废缓存，下次请求走全量 prefill
             llama_memory_clear(mem, true);
             session->kv_tokens.clear();

@@ -40,8 +40,8 @@ android {
         // （连纯 CPU 路径一起挂），所以这里直接把下限提到有 1.1 符号的 API 28。
         minSdk = 28
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.0.8"
+        versionCode = 10
+        versionName = "1.0.9"
 
         ndk {
             abiFilters += if (abiFilter != null) listOf(abiFilter) else listOf("arm64-v8a", "x86_64")

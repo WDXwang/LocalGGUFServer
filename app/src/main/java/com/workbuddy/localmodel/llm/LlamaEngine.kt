@@ -18,6 +18,18 @@ import java.io.File
  */
 object LlamaEngine {
 
+    /**
+     * 单次请求的 prompt token 预算。
+     *
+     * 真机实测（天玑 9300+ / Mali-G720，Qwen3.5-4B Q4_K_M，32 层全量卸载）prefill 稳定在
+     * 82~90 ms/token，且与 n_batch 大小无关（128/256/512/1024 四档差异都在 ±10% 内），
+     * 因为这批 Vulkan 路径没有吃到批处理并行收益。换算下来 prompt 每多 100 token 就多等约 9 秒。
+     *
+     * 1400 token ≈ 2 分钟等待，是"还能接受"和"点一下等半天"的分界。
+     * ctx 8192 只是容量上限，不代表该用满 —— 每轮都是全量重算，所以按这个预算裁历史。
+     */
+    private const val PROMPT_TOKEN_BUDGET = 1400
+
     private val _state = MutableStateFlow<EngineState>(EngineState.Idle)
     val state: StateFlow<EngineState> = _state.asStateFlow()
 
@@ -146,31 +158,50 @@ object LlamaEngine {
                 true
             )
 
-            // 上下文保护：prompt 超过 n_ctx 的 80%（再预留生成长度）时，从最早的非 system 消息开始丢弃。
-            // 只裁"发给模型的副本"，UI 里的历史消息原样保留，用户不会看到消息凭空消失。
+            // 上下文保护：两个预算取更严的那个
+            //   1) 模型上限：n_ctx 的 80% 再预留生成长度（硬限制，超了 native 会截断）
+            //   2) prompt 预算 PROMPT_TOKEN_BUDGET：真机实测 prefill 约 90ms/token
+            //      （32 层 Vulkan、与 batch 大小无关，见 GPU层数实测对照.md 第六节），
+            //      1400 token 约合 2 分钟等待。ctx 开到 8192 只是容量，不代表该用满：
+            //      每轮都会全量重算，prompt 越长等得越久，所以这里按预算裁而不是按 ctx 裁。
+            // 超预算时从最早的非 system 消息开始丢弃，只裁"发给模型的副本"，
+            // UI 里的历史消息原样保留，用户不会看到消息凭空消失。
             val ctx = info?.contextSize ?: 0
-            if (ctx > 0 && effective.size > 1) {
-                val reserve = params.maxTokens.coerceIn(0, ctx / 4)
-                val limit = (ctx * 8 / 10) - reserve
-                val promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
+            val reserve = params.maxTokens.coerceIn(0, 1024)
+            val ctxLimit = if (ctx > 0) (ctx * 8 / 10) - reserve else Int.MAX_VALUE
+            val limit = minOf(ctxLimit, PROMPT_TOKEN_BUDGET)
+            if (limit > 0 && effective.size > 1) {
+                var promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
+                var dropped = 0
+                while (promptTokens > limit && effective.size > 1) {
+                    val next = dropOldestMessage(effective)
+                    if (next.size == effective.size) break
+                    dropped += effective.size - next.size
+                    effective = next
+                    prompt = LlamaBridge.nativeBuildPrompt(
+                        h,
+                        effective.map { it.role }.toTypedArray(),
+                        effective.map { it.content }.toTypedArray(),
+                        true
+                    )
+                    promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
+                }
+                if (dropped > 0) {
+                    android.util.Log.i(
+                        "LlamaJNI",
+                        "context trim: prompt=$promptTokens <= limit=$limit " +
+                            "(budget=$PROMPT_TOKEN_BUDGET, ctx_limit=$ctxLimit), " +
+                            "dropped $dropped messages, kv_reset_on_next_prefill"
+                    )
+                    onNotice("上下文超出预算（约 2 分钟等待），已自动裁剪早期 $dropped 条历史")
+                }
                 if (promptTokens > limit) {
-                    val trimmed = trimToBudget(h, effective, limit)
-                    if (trimmed.size < effective.size) {
-                        val dropped = effective.size - trimmed.size
-                        android.util.Log.i(
-                            "LlamaJNI",
-                            "context trim: prompt=$promptTokens > limit=$limit, " +
-                                "dropped $dropped of ${effective.size} messages, kv_reset_on_next_prefill"
-                        )
-                        effective = trimmed
-                        prompt = LlamaBridge.nativeBuildPrompt(
-                            h,
-                            effective.map { it.role }.toTypedArray(),
-                            effective.map { it.content }.toTypedArray(),
-                            true
-                        )
-                        onNotice("上下文即将超限，已自动裁剪早期 $dropped 条历史")
-                    }
+                    // 只剩最后一条仍然超预算：没有可裁的历史了，交给 native 的 ctx 保护兜底
+                    android.util.Log.w(
+                        "LlamaJNI",
+                        "prompt still $promptTokens > limit=$limit after trimming, " +
+                            "single message too long"
+                    )
                 }
             }
 
@@ -181,28 +212,18 @@ object LlamaEngine {
     }
 
     /**
-     * 逐条丢弃最早的消息，直到 token 数落回预算内。
+     * 丢掉最早的一条（非 system）消息。
      *
      * 第一条是 system 时保留它，否则整轮对话会被剪成"只有一个问题"，预设提示词也就失效了。
-     * 至少保留最后一条（当前提问）。
+     * 一次只丢一条，由调用方重新计数后再决定是否继续 —— 按 token 计而不是按条数计。
      */
-    private fun trimToBudget(
-        h: Long,
-        messages: List<ChatMessage>,
-        limit: Int
-    ): List<ChatMessage> {
-        var list = messages
-        val keepHead = list.firstOrNull()?.role == "system"
-        while (list.size > 1) {
-            val tokens = LlamaBridge.nativeCountTokens(h, list.joinToString("\n") { it.content })
-            if (tokens <= limit) break
-            list = if (keepHead && list.size > 2) {
-                list.take(1) + list.drop(2)
-            } else {
-                list.drop(1)
-            }
+    private fun dropOldestMessage(messages: List<ChatMessage>): List<ChatMessage> {
+        if (messages.size <= 1) return messages
+        return if (messages.first().role == "system" && messages.size > 2) {
+            messages.take(1) + messages.drop(2)
+        } else {
+            messages.drop(1)
         }
-        return list
     }
 
     suspend fun complete(
@@ -303,6 +324,14 @@ object LlamaEngine {
         val decodeMs = timing?.getOrNull(1) ?: 0L
 
         if (ret < 0) {
+            if (ret == -6) {
+                // GPU 队列提交超时（长时间高温推理或 prompt 过长时驱动挂起）。
+                // context 已经不可用，继续用下去只会重复失败，直接卸载让用户重新加载。
+                // 注意：这里已持有 generationMutex，不能再调 unload()（会死锁）
+                android.util.Log.e("LlamaJNI", "Vulkan queue submit timeout, unloading model")
+                releaseLocked()
+                _state.value = EngineState.Idle
+            }
             Result.failure(
                 IllegalStateException(
                     when (ret) {
@@ -310,6 +339,7 @@ object LlamaEngine {
                         -2 -> "提示词分词失败"
                         -4 -> "推理失败，可能是上下文不足或内存不足"
                         -5 -> "已有生成任务正在进行"
+                        -6 -> "GPU 提交超时（多为设备过热或提示词过长），模型已卸载，请冷却后重新加载"
                         else -> "推理失败 (code=$ret)"
                     }
                 )
