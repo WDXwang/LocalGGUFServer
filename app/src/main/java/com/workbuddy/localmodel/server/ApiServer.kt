@@ -496,7 +496,11 @@ class ApiServer(
 
     /** 阻塞队列包装的 InputStream，用于 SSE 边生成边输出 */
     private class QueueInputStream : InputStream() {
-        private val queue = LinkedBlockingQueue<ByteArray?>()
+        // 注意：Java 的 LinkedBlockingQueue 不允许 null 元素，offer(null) 直接抛
+        // NullPointerException。之前写成 LinkedBlockingQueue<ByteArray?>() 只是骗过了
+        // Kotlin 编译器，运行时照样炸（crash: closeStream -> offer(null)）。
+        // 现在用 0 长度数组当"输入结束"哨兵，真实数据块不可能是空数组。
+        private val queue = LinkedBlockingQueue<ByteArray>()
         private var current: ByteArray? = null
         private var position = 0
 
@@ -511,8 +515,9 @@ class ApiServer(
         }
 
         fun closeStream() {
+            if (isClosed) return
             isClosed = true
-            queue.offer(null)
+            queue.offer(EOS)
         }
 
         override fun read(): Int {
@@ -532,20 +537,22 @@ class ApiServer(
 
         private fun ensure(): Boolean {
             while (current == null || position >= current!!.size) {
-                val next = queue.take() ?: return false
+                val next = queue.take()
+                if (next === EOS) return false
                 current = next
                 position = 0
             }
             return true
         }
 
+        // NanoHTTPD 在响应结束时也会调用 close()，两条路径都必须走同一套幂等逻辑
         override fun close() {
-            isClosed = true
-            queue.offer(null)
+            closeStream()
         }
     }
 
     private companion object {
         val DONE: ByteArray = "data: [DONE]\n\n".toByteArray(Charsets.UTF_8)
+        val EOS: ByteArray = ByteArray(0)
     }
 }

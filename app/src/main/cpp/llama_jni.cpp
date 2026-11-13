@@ -186,8 +186,17 @@ size_t utf8_complete_prefix(const std::string &s) {
     return last;
 }
 
+std::atomic<bool> g_verbose_logs{false};
+
 void android_log_callback(ggml_log_level level, const char *text, void * /*user_data*/) {
     if (text == nullptr) {
+        return;
+    }
+    // Debug 构建里 ggml 没有 NDEBUG，会按 DEBUG 级打印每个图节点的细节。
+    // 逐条 __android_log_write 是同步的 logd 事务，4B 模型 decode 时能把速度拖到
+    // 0.2 t/s 量级，属于实打实的性能损耗。默认只放 WARN 及以上，排障时用
+    // nativeSetVerboseLogging(true) 打开 DEBUG。
+    if (level == GGML_LOG_LEVEL_DEBUG && !g_verbose_logs.load(std::memory_order_relaxed)) {
         return;
     }
     int prio = ANDROID_LOG_DEBUG;
@@ -291,6 +300,12 @@ extern "C" {
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
     g_vm = vm;
     return JNI_VERSION_1_6;
+}
+
+JNIEXPORT void JNICALL
+Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeSetVerboseLogging(JNIEnv * /*env*/, jobject /*thiz*/, jboolean enabled) {
+    g_verbose_logs.store(enabled == JNI_TRUE, std::memory_order_relaxed);
+    LOGI("native verbose logging = %s", enabled == JNI_TRUE ? "on" : "off");
 }
 
 JNIEXPORT void JNICALL

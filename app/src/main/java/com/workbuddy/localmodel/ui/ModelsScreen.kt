@@ -317,7 +317,7 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                 }
                 Text(
                     "提示：上下文越大越占内存，Batch 越大 prefill 越快但内存峰值和发热也越高。" +
-                        "7B 建议 上下文 4096 / Batch 256 / 线程 4；当前构建仅启用 CPU 推理，GPU 层数可保持 0。",
+                        "7B 建议 上下文 4096 / Batch 256 / 线程 4；本版已编译 Vulkan 后端，GPU 层数从 0 起逐档上调，先用 8~16 层测速再决定是否加满。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.secondary
                 )

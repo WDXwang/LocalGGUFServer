@@ -7,6 +7,7 @@ object LlamaBridge {
 
     init {
         System.loadLibrary("localmodel")
+        nativeSetVerboseLogging(false)
         nativeBackendInit()
     }
 
@@ -19,6 +20,13 @@ object LlamaBridge {
     }
 
     external fun nativeBackendInit()
+
+    /**
+     * 是否把 llama.cpp/ggml 的 DEBUG 级日志转发到 logcat。
+     * Debug 构建里 ggml 会为每个图节点打一条日志，逐条写 logcat 是实打实的性能损耗
+     * （实测能把 4B 模型的 decode 拖到 0.2 t/s 级别），所以默认关闭，排障时再打开。
+     */
+    external fun nativeSetVerboseLogging(enabled: Boolean)
 
     external fun nativeLoadModel(
         path: String,

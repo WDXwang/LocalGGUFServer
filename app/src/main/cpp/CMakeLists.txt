@@ -86,3 +86,10 @@ target_link_libraries(localmodel
         llama
         android
         log)
+
+# Android 15+ 的 16KB 页设备：NDK r27 默认按 4KB 对齐，出的 .so 在 16KB 页机器上
+# 会被系统判定"不符合 16 KB 对齐要求"（启动即弹兼容性警告，加载/运行也可能异常）。
+# 显式把 LOAD 区段对齐提到 16KB；同时保留 4KB 兼容（max-page-size 只放大不改小）。
+target_link_options(localmodel PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        "-Wl,-z,common-page-size=16384")
