@@ -21,14 +21,25 @@ object LlamaEngine {
     /**
      * 单次请求的 prompt token 预算。
      *
-     * 真机实测（天玑 9300+ / Mali-G720，Qwen3.5-4B Q4_K_M，32 层全量卸载）prefill 稳定在
-     * 82~90 ms/token，且与 n_batch 大小无关（128/256/512/1024 四档差异都在 ±10% 内），
-     * 因为这批 Vulkan 路径没有吃到批处理并行收益。换算下来 prompt 每多 100 token 就多等约 9 秒。
+     * 真机实测（天玑 9300+ / Mali-G720，Qwen3.5-4B Q4_K_M，32 层全量卸载）：
      *
-     * 1400 token ≈ 2 分钟等待，是"还能接受"和"点一下等半天"的分界。
+     *   | prompt | prefill（凉机 45°C） | prefill（热机 88°C） |
+     *   |--------|---------------------|---------------------|
+     *   | 16     | 278ms（17ms/token）  | —                   |
+     *   | 152    | 约 2.6s              | 27.9s（180ms/token）|
+     *   | 490    | 约 8s                | 56.0s（114ms/token）|
+     *
+     * 且与 n_batch 大小无关（128/256/512/1024 四档差异都在 ±10% 内），
+     * 因为这批 Vulkan 路径没有吃到批处理并行收益。
+     *
+     * 热机下成本是凉机的 6~10 倍，所以预算按"最坏情况"定：700 token 热机约 80~125 秒首字，
+     * 已经是"还能忍"的上限；1400 token 会变成 2~4 分钟，用户直接以为卡死。
+     * 另外 decode 也随上下文变长而变慢（kv=56 时 3.43 t/s，kv=500 时只有 0.24 t/s），
+     * 砍历史同时也在救 decode，不只是救 prefill。
+     *
      * ctx 8192 只是容量上限，不代表该用满 —— 每轮都是全量重算，所以按这个预算裁历史。
      */
-    private const val PROMPT_TOKEN_BUDGET = 1400
+    private const val PROMPT_TOKEN_BUDGET = 700
 
     private val _state = MutableStateFlow<EngineState>(EngineState.Idle)
     val state: StateFlow<EngineState> = _state.asStateFlow()
