@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
@@ -249,6 +250,17 @@ class ApiServer(
     ): Response {
         val queue = QueueInputStream()
         scope.launch {
+            // 首字延迟在真机上可能很长（烫机时 prefill 约 180ms/token，152 token 的 prompt
+            // 就要 28 秒才出第一个字）。这段时间一个字节都不发，不少客户端会当成超时或卡死。
+            // 每 5 秒推一行 SSE 注释行（": ping"）保活，客户端会忽略注释内容，但连接和
+            // "还在处理" 的状态是通的。
+            val heartbeat = launch {
+                while (true) {
+                    delay(5000)
+                    if (queue.isClosed) break
+                    queue.push(HEARTBEAT)
+                }
+            }
             try {
                 queue.push(sse(chatChunk(id, created, null, null, roleOnly = true)))
                 // 注意：必须用具名参数写 onToken。
@@ -269,6 +281,7 @@ class ApiServer(
                     }
                 )
             } finally {
+                heartbeat.cancel()
                 queue.push(DONE)
                 queue.closeStream()
             }
@@ -557,6 +570,8 @@ class ApiServer(
 
     private companion object {
         val DONE: ByteArray = "data: [DONE]\n\n".toByteArray(Charsets.UTF_8)
+        // SSE 注释行：客户端会忽略内容，只用来在长时间 prefill 期间保持连接不被判超时。
+        val HEARTBEAT: ByteArray = ": ping\n\n".toByteArray(Charsets.UTF_8)
         val EOS: ByteArray = ByteArray(0)
     }
 }
