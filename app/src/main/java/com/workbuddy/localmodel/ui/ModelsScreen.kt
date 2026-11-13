@@ -200,6 +200,10 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                                 LlamaEngine.load(model.file, config)
                                     .onSuccess { loaded ->
                                         settings.lastModelPath = model.file.absolutePath
+                                        // 记下模型层数，供「自动推荐」在未加载状态下给出全量卸载值
+                                        if (loaded.layerCount > 0) {
+                                            settings.lastLayerCount = loaded.layerCount
+                                        }
                                         var note = "已加载 ${loaded.name}"
                                         if (previousPath != null && previousPath != loaded.path) {
                                             // 换了模型：旧对话对新模型没有意义，直接重置
@@ -297,6 +301,30 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
+                    TextButton(
+                        onClick = {
+                            // 实测结论：Mali-G720 上全量卸载最快，部分卸载反而因为算子反复在
+                            // GPU/CPU 之间切分（splits 从 19 涨到 275）而变慢，所以推荐值直接取模型层数。
+                            val info = LlamaEngine.currentInfo
+                            val supported = info?.gpuOffloadSupported ?: true
+                            val loadedLayers = info?.layerCount ?: 0
+                            val layers = when {
+                                !supported -> 0
+                                loadedLayers > 0 -> loadedLayers
+                                settings.lastLayerCount > 0 -> settings.lastLayerCount
+                                else -> 32
+                            }
+                            gpuText = layers.toString()
+                            settings.gpuLayers = layers
+                            message = if (layers == 0) {
+                                "本版未编译 GPU 后端，保持纯 CPU 推理"
+                            } else {
+                                "已填入推荐层数 $layers（全量卸载），加载后可用 t/s 验证"
+                            }
+                        }
+                    ) {
+                        Text("自动推荐")
+                    }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
@@ -317,7 +345,9 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                 }
                 Text(
                     "提示：上下文越大越占内存，Batch 越大 prefill 越快但内存峰值和发热也越高。" +
-                        "7B 建议 上下文 4096 / Batch 256 / 线程 4；本版已编译 Vulkan 后端，GPU 层数从 0 起逐档上调，先用 8~16 层测速再决定是否加满。",
+                        "7B 建议 上下文 4096 / Batch 256 / 线程 4；" +
+                        "GPU 层数建议直接点「自动推荐」用全量卸载——真机实测（Qwen3.5-4B / Mali-G720）" +
+                        "0 层 2.7 t/s、16 层 3.0、24 层 3.5、全量 32 层 6.0 t/s，prefill 也从 9.4s 降到 2.3s。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.secondary
                 )

@@ -68,6 +68,17 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt(KEY_GPU_LAYERS, 0)
         set(value) = prefs.edit().putInt(KEY_GPU_LAYERS, value).apply()
 
+    /**
+     * 上一次加载的模型的层数。
+     *
+     * 用来在「模型还没加载」的时候给出 GPU 层数推荐：真机上实测（Qwen3.5-4B / Mali-G720）
+     * 层数越多越快，全量卸载（层数=模型层数）时 prefill 从 9.4s 降到 2.3s、decode 从 2.7 提到 6.0 t/s，
+     * 所以推荐值就是模型的全部层数，而不是保守的部分卸载。
+     */
+    var lastLayerCount: Int
+        get() = prefs.getInt(KEY_LAST_LAYER_COUNT, 0)
+        set(value) = prefs.edit().putInt(KEY_LAST_LAYER_COUNT, value).apply()
+
     var port: Int
         get() = prefs.getInt(KEY_PORT, 8080)
         set(value) = prefs.edit().putInt(KEY_PORT, value).apply()
@@ -112,6 +123,7 @@ class SettingsStore(context: Context) {
         const val KEY_BATCH = "batch_size"
         const val KEY_USE_MLOCK = "use_mlock"
         const val KEY_GPU_LAYERS = "gpu_layers"
+        const val KEY_LAST_LAYER_COUNT = "last_layer_count"
         const val KEY_PORT = "server_port"
         const val KEY_API_KEY = "api_key"
         const val KEY_MAX_TOKENS = "max_tokens"
