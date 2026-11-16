@@ -66,6 +66,7 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
     var threadText by rememberSaveable { mutableStateOf(settings.threads.toString()) }
     var batchText by rememberSaveable { mutableStateOf(settings.batchSize.toString()) }
     var gpuText by rememberSaveable { mutableStateOf(settings.gpuLayers.toString()) }
+    var kvText by rememberSaveable { mutableStateOf(settings.kvMode) }
     var mlockOn by rememberSaveable { mutableStateOf(settings.useMlock) }
     var thinkOn by rememberSaveable { mutableStateOf(settings.thinkMode) }
     var importing by remember { mutableStateOf(false) }
@@ -159,6 +160,15 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                             style = MaterialTheme.typography.bodySmall,
                             color = if (gpu.gpuActive) Color(0xFF2E7D32) else MaterialTheme.colorScheme.secondary
                         )
+                        // 把 KV/FA/线程的真实现状摊开：这三个决定 decode 速度，光看 t/s 说不清原因
+                        if (gpu.flashAttn.isNotBlank() || gpu.kvType.isNotBlank()) {
+                            Text(
+                                "FA=${gpu.flashAttn.ifBlank { "?" }} · KV=${gpu.kvType.ifBlank { "?" }} · " +
+                                    "线程 ${gpu.decodeThreads}/${gpu.prefillThreads}（decode/prefill）",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
                     }
 
                     is EngineState.Failed -> Text(
@@ -186,14 +196,18 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                                 contextSize = contextText.toIntOrNull()?.coerceIn(512, 131072) ?: 8192,
                                 threads = threadText.toIntOrNull()?.coerceIn(1, 32) ?: settings.threads,
                                 batchSize = batchText.toIntOrNull()?.coerceIn(32, 2048) ?: 256,
-                                gpuLayers = gpuText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
-                                useMlock = mlockOn
+                                // -1 = 全部层（自动）；留空则沿用已保存的设置
+                                gpuLayers = gpuText.trim().toIntOrNull()?.let { if (it < 0) -1 else it.coerceIn(0, 200) }
+                                    ?: settings.gpuLayers,
+                                useMlock = mlockOn,
+                                kvMode = kvText.ifBlank { "auto" }
                             )
                             settings.contextSize = config.contextSize
                             settings.threads = config.threads
                             settings.batchSize = config.batchSize
                             settings.gpuLayers = config.gpuLayers
                             settings.useMlock = config.useMlock
+                            settings.kvMode = config.kvMode
                             scope.launch {
                                 message = null
                                 // 记录加载前的模型，用于判断这次是"换模型"还是"重载同一个"
@@ -306,8 +320,8 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                     )
                     OutlinedTextField(
                         value = gpuText,
-                        onValueChange = { gpuText = it.filter(Char::isDigit) },
-                        label = { Text("GPU 层数") },
+                        onValueChange = { gpuText = it.filter { ch -> ch.isDigit() || ch == '-' } },
+                        label = { Text("GPU 层数（-1=全部）") },
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
@@ -335,6 +349,21 @@ fun ModelsScreen(modifier: Modifier = Modifier) {
                     ) {
                         Text("自动推荐")
                     }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = kvText,
+                        onValueChange = { kvText = it.filter { ch -> ch.isLetter() || ch == '_' } },
+                        label = { Text("KV/FA 模式") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1.2f)
+                    )
+                    Text(
+                        "auto / q8_fa / q8_auto / f16_auto（换一种组合重新加载生效）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.weight(1.8f)
+                    )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

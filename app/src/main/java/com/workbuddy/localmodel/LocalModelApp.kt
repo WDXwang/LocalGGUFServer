@@ -21,6 +21,8 @@ class LocalModelApp : Application() {
         // 老版本默认 4096 迁移到 8192：ctx 太小时自动裁剪会把历史压到几千 token，
         // 每轮都全量重算 prefill，这是真机上几十秒延迟的主因
         settings.migrateContextDefaultIfNeeded()
+        // 老的"GPU 层数默认 0"迁移到 -1（全部层）：装了 Vulkan 包却跑纯 CPU 是白装
+        settings.migrateGpuLayersDefaultIfNeeded()
         LlamaEngine.attach(this)
         // 温控监听挂在 Application 上：进程活多久就监听多久，
         // 不依赖某个页面是否在前台

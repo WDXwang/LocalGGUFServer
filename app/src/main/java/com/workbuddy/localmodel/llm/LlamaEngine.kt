@@ -3,6 +3,7 @@ package com.workbuddy.localmodel.llm
 import android.app.ActivityManager
 import android.content.Context
 import com.workbuddy.localmodel.model.SettingsStore
+import com.workbuddy.localmodel.util.ThermalMonitor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,33 +21,52 @@ import java.io.File
 object LlamaEngine {
 
     /**
-     * 单次请求的 prompt token 预算。
+     * prompt token 预算：**动态**，取 ctx 的 90% 再扣掉本次生成长度。
      *
-     * 真机实测（天玑 9300+ / Mali-G720，Qwen3.5-4B Q4_K_M，32 层全量卸载）：
+     * 之前这里是一个写死的 700，理由是"每轮都全量重算，prompt 越长首字越久"。
+     * 但那个前提在日志里被证伪了：`context trim: ... dropped 13 of 14 messages, kv_reset_on_next_prefill`
+     * —— 预算 700 让聊天历史几乎每轮都被裁到只剩一条，prompt 头部一变，
+     * 从位置 0 求公共前缀的 KV 复用就永远命中 0，于是"裁剪"和"复用"互相废掉，
+     * 每轮真的变成全量 prefill（实测 prefill=49993ms）。
      *
-     *   | prompt | prefill（凉机 45°C） | prefill（热机 88°C） |
-     *   |--------|---------------------|---------------------|
-     *   | 16     | 278ms（17ms/token）  | —                   |
-     *   | 152    | 约 2.6s              | 27.9s（180ms/token）|
-     *   | 490    | 约 8s                | 56.0s（114ms/token）|
+     * 现在的口径：
+     *   limit = ctx * 9 / 10 - reserve，reserve = maxTokens（夹在 0..1024）
+     * ctx=8192 时约 6800 token，几十轮对话都留得住，KV 复用才有意义；
+     * 只有真的超了才裁，且裁完会打 `context trim` 日志，可观测。
      *
-     * 且与 n_batch 大小无关（128/256/512/1024 四档差异都在 ±10% 内），
-     * 因为这批 Vulkan 路径没有吃到批处理并行收益。
-     *
-     * 热机下成本是凉机的 6~10 倍，所以预算按"最坏情况"定：700 token 热机约 80~125 秒首字，
-     * 已经是"还能忍"的上限；1400 token 会变成 2~4 分钟，用户直接以为卡死。
-     * 另外 decode 也随上下文变长而变慢（kv=56 时 3.43 t/s，kv=500 时只有 0.24 t/s），
-     * 砍历史同时也在救 decode，不只是救 prefill。
-     *
-     * ctx 8192 只是容量上限，不代表该用满 —— 每轮都是全量重算，所以按这个预算裁历史。
+     * 注意这个上限只约束"发给模型的副本"，UI 里的历史消息不受影响。
      */
-    private const val PROMPT_TOKEN_BUDGET = 700
+    private fun promptLimit(ctx: Int, maxTokens: Int): Int {
+        if (ctx <= 0) return Int.MAX_VALUE
+        val reserve = maxTokens.coerceIn(0, 1024)
+        return (ctx * 9 / 10 - reserve).coerceAtLeast(256)
+    }
+
+    /** 每条消息在 chat 模板里的固定开销（role 标记、分隔符），经验值 5 token */
+    private const val MESSAGE_TEMPLATE_OVERHEAD = 5
 
     private val _state = MutableStateFlow<EngineState>(EngineState.Idle)
     val state: StateFlow<EngineState> = _state.asStateFlow()
 
     private val generationMutex = Mutex()
     private val freeLock = Any()
+
+    /** 并发闸门：HTTP 侧靠它快速失败（429），UI 侧靠它抢占 */
+    private val inflight = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** 正在生成的请求 id 与来源，供"按 id 取消"与 UI 抢占使用 */
+    @Volatile
+    private var activeRequestId: String? = null
+
+    @Volatile
+    private var activeOwner: String = ""
+
+    /** 最近一次推理的规模指标，/health 直接读它 */
+    @Volatile
+    var lastStats: EngineStats = EngineStats()
+        private set
+
+    val isBusy: Boolean get() = inflight.get() > 0
 
     /** 应用 Context，用于加载前查询可用内存 */
     @Volatile
@@ -110,14 +130,42 @@ object LlamaEngine {
                         return@withLock Result.failure(IllegalStateException(message))
                     }
 
-                    val h = LlamaBridge.nativeLoadModel(
-                        path = file.absolutePath,
-                        nThreads = config.threads,
-                        nCtx = config.contextSize,
-                        nBatch = config.batchSize,
-                        nGpuLayers = config.gpuLayers,
-                        nMlock = config.useMlock
-                    )
+                    val nThreadsBatch = resolvePrefillThreads(config)
+                    val kvMode = resolveKvMode(config)
+                    // GPU 层数回退链：-1（全量）→ 一半 → 0（纯 CPU）。
+                    // 部分机型/驱动在全量卸载时会加载失败或直接崩，逐级退到能跑为止，
+                    // 并把实际生效值写回设置，下次就不用再退一遍。
+                    val candidates = buildList {
+                        add(config.gpuLayers)
+                        if (config.gpuLayers < 0) add(16)
+                        add(0)
+                    }.distinct()
+                    var h = 0L
+                    var usedLayers = config.gpuLayers
+                    for (layers in candidates) {
+                        h = LlamaBridge.nativeLoadModel(
+                            path = file.absolutePath,
+                            nThreads = config.threads,
+                            nThreadsBatch = nThreadsBatch,
+                            nCtx = config.contextSize,
+                            nBatch = config.batchSize,
+                            nGpuLayers = layers,
+                            nMlock = config.useMlock,
+                            kvMode = kvMode
+                        )
+                        if (h != 0L) {
+                            usedLayers = layers
+                            if (layers != config.gpuLayers) {
+                                android.util.Log.w(
+                                    "LlamaJNI",
+                                    "gpu layer fallback: requested=${config.gpuLayers} effective=$layers"
+                                )
+                                settings?.gpuLayers = layers
+                            }
+                            break
+                        }
+                        android.util.Log.w("LlamaJNI", "load failed with gpu_layers=$layers, retrying lower")
+                    }
                     if (h == 0L) {
                         val message = "模型加载失败，请确认文件是有效的 GGUF 且内存充足"
                         _state.value = EngineState.Failed(message)
@@ -135,11 +183,15 @@ object LlamaEngine {
                     )
                     val gpu = parseGpuInfo(LlamaBridge.nativeGpuInfo(h))
                     val infoWithGpu = loaded.copy(
-                        gpuLayersRequested = gpu.requested,
+                        gpuLayersRequested = usedLayers,
                         gpuLayersEffective = gpu.effective,
                         layerCount = gpu.layers,
                         gpuOffloadSupported = gpu.offload,
-                        gpuDevices = gpu.devices
+                        gpuDevices = gpu.devices,
+                        flashAttn = gpu.fa,
+                        kvType = gpu.kvType,
+                        decodeThreads = gpu.threads,
+                        prefillThreads = gpu.threadsBatch
                     )
                     synchronized(freeLock) { handle = h }
                     info = infoWithGpu
@@ -161,7 +213,7 @@ object LlamaEngine {
         }
     }
 
-    /** 中断当前生成（可从任意线程调用） */
+    /** 中断当前生成（可从任意线程调用，等价于取消"正在跑的那个请求"） */
     fun cancel() {
         synchronized(freeLock) {
             val h = handle
@@ -171,114 +223,222 @@ object LlamaEngine {
         }
     }
 
-    suspend fun chat(
-        messages: List<ChatMessage>,
-        params: GenParams,
-        onToken: (String) -> Unit = {},
-        onNotice: (String) -> Unit = {}
-    ): Result<GenResult> = generationMutex.withLock {
-        val h = handle
-        if (h == 0L) {
-            return@withLock Result.failure(IllegalStateException("尚未加载模型"))
-        }
-        try {
-            // 预设的系统提示词作为第一条 system 消息参与 chat 模板；
-            // 调用方自己已经带了 system 消息就不重复插入
-            var effective = if (params.systemPrompt.isBlank() || messages.firstOrNull()?.role == "system") {
-                messages
-            } else {
-                listOf(ChatMessage("system", params.systemPrompt)) + messages
-            }
-            var prompt = LlamaBridge.nativeBuildPrompt(
-                h,
-                effective.map { it.role }.toTypedArray(),
-                effective.map { it.content }.toTypedArray(),
-                true
-            )
-            // 关闭思考时把空的 <think> 块预填进去，模型直接写正文，省掉一整段推理 token
-            prompt = applyThinkPrefill(prompt)
-
-            // 上下文保护：两个预算取更严的那个
-            //   1) 模型上限：n_ctx 的 80% 再预留生成长度（硬限制，超了 native 会截断）
-            //   2) prompt 预算 PROMPT_TOKEN_BUDGET：真机实测 prefill 约 90ms/token
-            //      （32 层 Vulkan、与 batch 大小无关，见 GPU层数实测对照.md 第六节），
-            //      1400 token 约合 2 分钟等待。ctx 开到 8192 只是容量，不代表该用满：
-            //      每轮都会全量重算，prompt 越长等得越久，所以这里按预算裁而不是按 ctx 裁。
-            // 超预算时从最早的非 system 消息开始丢弃，只裁"发给模型的副本"，
-            // UI 里的历史消息原样保留，用户不会看到消息凭空消失。
-            val ctx = info?.contextSize ?: 0
-            val reserve = params.maxTokens.coerceIn(0, 1024)
-            val ctxLimit = if (ctx > 0) (ctx * 8 / 10) - reserve else Int.MAX_VALUE
-            val limit = minOf(ctxLimit, PROMPT_TOKEN_BUDGET)
-            if (limit > 0 && effective.size > 1) {
-                var promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
-                var dropped = 0
-                while (promptTokens > limit && effective.size > 1) {
-                    val next = dropOldestMessage(effective)
-                    if (next.size == effective.size) break
-                    dropped += effective.size - next.size
-                    effective = next
-                    prompt = applyThinkPrefill(LlamaBridge.nativeBuildPrompt(
-                        h,
-                        effective.map { it.role }.toTypedArray(),
-                        effective.map { it.content }.toTypedArray(),
-                        true
-                    ))
-                    promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
-                }
-                if (dropped > 0) {
-                    android.util.Log.i(
-                        "LlamaJNI",
-                        "context trim: prompt=$promptTokens <= limit=$limit " +
-                            "(budget=$PROMPT_TOKEN_BUDGET, ctx_limit=$ctxLimit), " +
-                            "dropped $dropped messages, kv_reset_on_next_prefill"
-                    )
-                    onNotice("上下文超出预算（约 2 分钟等待），已自动裁剪早期 $dropped 条历史")
-                }
-                if (promptTokens > limit) {
-                    // 只剩最后一条仍然超预算：没有可裁的历史了，交给 native 的 ctx 保护兜底
-                    android.util.Log.w(
-                        "LlamaJNI",
-                        "prompt still $promptTokens > limit=$limit after trimming, " +
-                            "single message too long"
-                    )
-                }
-            }
-
-            generateLocked(h, prompt, params, onToken)
-        } catch (t: Throwable) {
-            Result.failure(t)
-        }
+    /**
+     * 按 requestId 取消。
+     *
+     * 旧实现是无条件 nativeStop：并发场景下 A 客户端断开会把 B 正在跑的生成一起杀掉
+     * （native 里 stop 是 context 级的，没有请求维度）。HTTP 侧现在给每个请求带 id，
+     * 只有 id 匹配当前在跑的那个才真的停。
+     */
+    fun cancelRequest(requestId: String) {
+        if (requestId.isBlank()) return
+        if (activeRequestId != requestId) return
+        cancel()
     }
 
     /**
-     * 丢掉最早的一条（非 system）消息。
+     * 并发准入。
      *
-     * 第一条是 system 时保留它，否则整轮对话会被剪成"只有一个问题"，预设提示词也就失效了。
-     * 一次只丢一条，由调用方重新计数后再决定是否继续 —— 按 token 计而不是按条数计。
+     * HTTP 侧只放 1 个生成进来，第二个立刻返回失败（映射成 429），
+     * 而不是像以前那样在 Mutex 上静默排队 —— 排队在真机上是灾难：
+     * 一个请求可能跑 2 分钟，客户端早就超时了，服务端还在替它烧电。
+     * UI 侧优先：允许叠加，并顺手把正在跑的 API 请求掐掉。
      */
-    private fun dropOldestMessage(messages: List<ChatMessage>): List<ChatMessage> {
-        if (messages.size <= 1) return messages
-        return if (messages.first().role == "system" && messages.size > 2) {
-            messages.take(1) + messages.drop(2)
-        } else {
-            messages.drop(1)
+    private fun admit(requestId: String?, owner: String) {
+        if (owner == "api") {
+            if (!inflight.compareAndSet(0, 1)) {
+                throw EngineBusyException("已有生成任务在进行，请稍后重试（当前模型单并发）")
+            }
+            return
+        }
+        inflight.incrementAndGet()
+        if (activeOwner == "api") {
+            activeRequestId?.let { cancelRequest(it) }
+        }
+    }
+
+    /** 热降级是否已生效（滞回）：≥2 降级、≤1 才恢复，避免在阈值上反复横跳 */
+    @Volatile
+    private var thermalLatched = false
+
+    /**
+     * 温控策略下沉到引擎。
+     *
+     * 以前这套判断只在 ChatStore 里（UI 专用），HTTP API 完全不受约束 ——
+     * 客户端可以在 88°C 的机器上连续打 512 token 的请求，直到驱动超时（-6）。
+     * 现在两条入口都过这里：
+     *   level >= 4  直接拒绝（映射 503 + Retry-After）
+     *   level >= 3  maxTokens 压到 128
+     *   level >= 2  生成长度砍半（上限 256）
+     * 并带滞回：降到 2 档后即使瞬回 3 档以下也保持降级，直到回落到 ≤1 才恢复。
+     */
+    private fun applyThermal(params: GenParams): GenParams {
+        val level = ThermalMonitor.status.value
+        if (level >= 4) {
+            throw EngineThermalException("设备过热（热状态 $level），已暂停生成本次请求，请冷却后再试")
+        }
+        if (level >= 2) thermalLatched = true else if (level <= 1) thermalLatched = false
+        if (!thermalLatched) return params
+        val cap = if (level >= 3) 128 else 256
+        val trimmed = minOf(params.maxTokens, cap, (params.maxTokens / 2).coerceAtLeast(64))
+        if (trimmed == params.maxTokens) return params
+        android.util.Log.i(
+            "LlamaJNI",
+            "thermal degrade: level=$level max_tokens ${params.maxTokens} -> $trimmed"
+        )
+        return params.copy(maxTokens = trimmed)
+    }
+
+    /** 热降级时同步降线程：8 线程 prefill 的瞬时电流明显高于 4 线程 */
+    private fun applyThermalThreads(h: Long) {
+        val level = ThermalMonitor.status.value
+        if (level < 2) return
+        val cur = info ?: return
+        val decode = (cur.decodeThreads / 2).coerceIn(2, 8)
+        val batch = (cur.prefillThreads / 2).coerceIn(2, 8)
+        runCatching { LlamaBridge.nativeSetThreads(h, decode, batch) }
+            .onSuccess { android.util.Log.i("LlamaJNI", "thermal threads: decode=$decode batch=$batch") }
+    }
+
+    suspend fun chat(
+        messages: List<ChatMessage>,
+        params: GenParams,
+        requestId: String? = null,
+        owner: String = "ui",
+        onToken: (String) -> Unit = {},
+        onNotice: (String) -> Unit = {}
+    ): Result<GenResult> {
+        try {
+            admit(requestId, owner)
+        } catch (t: Throwable) {
+            return Result.failure(t)
+        }
+        try {
+            return generationMutex.withLock {
+                val h = handle
+                if (h == 0L) {
+                    return@withLock Result.failure(IllegalStateException("尚未加载模型"))
+                }
+                activeRequestId = requestId
+                activeOwner = owner
+                try {
+                    // 预设的系统提示词作为第一条 system 消息参与 chat 模板；
+                    // 调用方自己已经带了 system 消息就不重复插入
+                    var effective = if (params.systemPrompt.isBlank() || messages.firstOrNull()?.role == "system") {
+                        messages
+                    } else {
+                        listOf(ChatMessage("system", params.systemPrompt)) + messages
+                    }
+
+                    // 上下文保护：limit = ctx * 9 / 10 - reserve（见 promptLimit 注释）。
+                    // 只有真的超了才裁，且裁的是"发给模型的副本"，UI 历史原样保留。
+                    // 裁一次就要重建 prompt，所以先按单条消息的 token 数一次算出丢几条，
+                    // 避免旧实现那种"丢一条→重建→重新计数"的 O(n²) native 调用。
+                    var prompt = applyThinkPrefill(
+                        LlamaBridge.nativeBuildPrompt(
+                            h,
+                            effective.map { it.role }.toTypedArray(),
+                            effective.map { it.content }.toTypedArray(),
+                            true
+                        )
+                    )
+                    val ctx = info?.contextSize ?: 0
+                    val limit = promptLimit(ctx, params.maxTokens)
+                    var promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
+                    if (limit > 0 && promptTokens > limit && effective.size > 1) {
+                        val perMessage = effective.map {
+                            LlamaBridge.nativeCountTokens(h, it.content) + MESSAGE_TEMPLATE_OVERHEAD
+                        }
+                        val keepSystem = effective.first().role == "system"
+                        var idx = if (keepSystem) 1 else 0
+                        var total = promptTokens
+                        var dropped = 0
+                        while (total > limit && idx < effective.size - 1) {
+                            total -= perMessage[idx]
+                            idx++
+                            dropped++
+                        }
+                        if (dropped > 0) {
+                            effective = buildList {
+                                if (keepSystem) add(effective.first())
+                                addAll(effective.subList(idx, effective.size))
+                            }
+                            prompt = applyThinkPrefill(
+                                LlamaBridge.nativeBuildPrompt(
+                                    h,
+                                    effective.map { it.role }.toTypedArray(),
+                                    effective.map { it.content }.toTypedArray(),
+                                    true
+                                )
+                            )
+                            promptTokens = LlamaBridge.nativeCountTokens(h, prompt)
+                            android.util.Log.i(
+                                "LlamaJNI",
+                                "context trim: prompt=$promptTokens <= limit=$limit " +
+                                    "(ctx=$ctx, reserve=${params.maxTokens}), " +
+                                    "dropped $dropped of ${dropped + effective.size} messages, " +
+                                    "kv_reset_on_next_prefill"
+                            )
+                            onNotice("上下文超出模型窗口的 90%，已自动裁剪早期 $dropped 条历史")
+                        }
+                        if (promptTokens > limit) {
+                            // 只剩最后一条仍然超预算：没有可裁的历史了，交给 native 的 ctx 保护兜底
+                            android.util.Log.w(
+                                "LlamaJNI",
+                                "prompt still $promptTokens > limit=$limit after trimming, " +
+                                    "single message too long"
+                            )
+                        }
+                    }
+
+                    val effectiveParams = applyThermal(params)
+                    if (thermalLatched) applyThermalThreads(h)
+                    generateLocked(h, prompt, effectiveParams, onToken)
+                } catch (t: Throwable) {
+                    Result.failure(t)
+                } finally {
+                    activeRequestId = null
+                    activeOwner = ""
+                }
+            }
+        } finally {
+            inflight.decrementAndGet()
         }
     }
 
     suspend fun complete(
         prompt: String,
         params: GenParams,
+        requestId: String? = null,
+        owner: String = "ui",
         onToken: (String) -> Unit = {}
-    ): Result<GenResult> = generationMutex.withLock {
-        val h = handle
-        if (h == 0L) {
-            return@withLock Result.failure(IllegalStateException("尚未加载模型"))
+    ): Result<GenResult> {
+        try {
+            admit(requestId, owner)
+        } catch (t: Throwable) {
+            return Result.failure(t)
         }
         try {
-            generateLocked(h, prompt, params, onToken)
-        } catch (t: Throwable) {
-            Result.failure(t)
+            return generationMutex.withLock {
+                val h = handle
+                if (h == 0L) {
+                    return@withLock Result.failure(IllegalStateException("尚未加载模型"))
+                }
+                activeRequestId = requestId
+                activeOwner = owner
+                try {
+                    val effectiveParams = applyThermal(params)
+                    if (thermalLatched) applyThermalThreads(h)
+                    generateLocked(h, prompt, effectiveParams, onToken)
+                } catch (t: Throwable) {
+                    Result.failure(t)
+                } finally {
+                    activeRequestId = null
+                    activeOwner = ""
+                }
+            }
+        } finally {
+            inflight.decrementAndGet()
         }
     }
 
@@ -362,6 +522,20 @@ object LlamaEngine {
         val timing = runCatching { LlamaBridge.nativeLastTiming(h) }.getOrNull()
         val prefillMs = timing?.getOrNull(0) ?: 0L
         val decodeMs = timing?.getOrNull(1) ?: 0L
+        // 真正提交给模型的 prompt 长度与 KV 命中量（由 native 侧在 tokenize 后记录，
+        // 比在 Kotlin 侧重新 countTokens 更准 —— 旧实现用的正是裁剪前的计数，stealth 虚高）
+        val promptTokens = timing?.getOrNull(3)?.toInt() ?: prefill
+        val kvReuse = timing?.getOrNull(4)?.toInt() ?: 0
+        lastStats = EngineStats(
+            promptTokens = promptTokens,
+            kvReuseTokens = kvReuse,
+            prefillMs = prefillMs,
+            decodeMs = decodeMs,
+            generatedTokens = generated,
+            thermalLevel = ThermalMonitor.status.value,
+            decodeThreads = info?.decodeThreads ?: 0,
+            prefillThreads = info?.prefillThreads ?: 0
+        )
 
         if (ret < 0) {
             if (ret == -6) {
@@ -372,25 +546,29 @@ object LlamaEngine {
                 releaseLocked()
                 _state.value = EngineState.Idle
             }
-            Result.failure(
+            // -5（native 的 try_lock 失败）统一当成"忙"，HTTP 侧据此回 429 而不是 500
+            val error: Throwable = if (ret == -5) {
+                EngineBusyException("已有生成任务在进行，请稍后重试（当前模型单并发）")
+            } else {
                 IllegalStateException(
                     when (ret) {
                         -1 -> "推理引擎不可用"
                         -2 -> "提示词分词失败"
                         -4 -> "推理失败，可能是上下文不足或内存不足"
-                        -5 -> "已有生成任务正在进行"
                         -6 -> "GPU 提交超时（多为设备过热或提示词过长），模型已卸载，请冷却后重新加载"
                         else -> "推理失败 (code=$ret)"
                     }
                 )
-            )
+            }
+            Result.failure(error)
         } else {
             Result.success(
                 GenResult(
                     text = builder.toString(),
                     generatedTokens = generated,
                     finishReason = finishReason,
-                    prefillTokens = prefill,
+                    prefillTokens = promptTokens,
+                    kvReuseTokens = kvReuse,
                     prefillMs = prefillMs,
                     decodeMs = decodeMs
                 )
@@ -401,11 +579,13 @@ object LlamaEngine {
     /**
      * 加载前内存预估。返回非 null 表示"不够，别加载"，字符串是要给用户看的原因。
      *
-     * 估算口径（偏保守，目的只是拦住必然 OOM 的情况）：
-     *   权重     = 文件大小 ×（mlock 1.5 / mmap 1.2）——mlock 会把整份权重钉在物理内存，
-     *              另需一段连续空间给计算图张量；mmap 时权重可以按页换入，但要留计算缓冲
-     *   KV cache = n_ctx × 40KB（按 4B 级模型 32 层 / GQA 8 KV 头 / fp16 的典型值）
-     *   固定开销 = 128MB（计算图、tokenizer、采样器、日志缓冲等）
+     * 估算口径（只需要拦住必然 OOM 的情况，宁可略保守，但不能把能跑的模型拦下来）：
+     *   权重 = 文件大小 —— mlock 只是把这些页钉住不换出，并不需要额外一份拷贝；
+     *          之前按 1.5 倍估会凭空多算 50%，2GB 的 3B 模型因此被误判成"需要 3.2GB"直接拒载。
+     *   KV   = n_ctx × 40KB（按 4B 级模型 32 层 / GQA 8 KV 头 / fp16 的典型值；
+     *          q8_0 KV 实际只用一半，所以这是上界）
+     *   固定 = 256MB（Vulkan compute buffer 实测约 509MB 但可复用/可换出，加上 tokenizer、
+     *          采样器、日志缓冲取 256MB 更贴近真实增量）
      */
     private fun memoryShortfall(file: File, config: LoadConfig): String? {
         val context = appContext ?: return null
@@ -414,10 +594,9 @@ object LlamaEngine {
         runCatching { am.getMemoryInfo(mi) }.getOrNull() ?: return null
 
         val fileBytes = file.length()
-        val weightFactor = if (config.useMlock) 1.5 else 1.2
         val kvBytes = config.contextSize.toLong() * 40_960L
-        val overhead = 128L * 1024 * 1024
-        val need = (fileBytes * weightFactor).toLong() + kvBytes + overhead
+        val overhead = 256L * 1024 * 1024
+        val need = fileBytes + kvBytes + overhead
         if (mi.availMem >= need) return null
 
         fun gb(v: Long) = String.format("%.1f", v / 1024.0 / 1024.0 / 1024.0)
@@ -435,7 +614,11 @@ object LlamaEngine {
         val layers: Int,
         val requested: Int,
         val effective: Int,
-        val devices: String
+        val devices: String,
+        val fa: String = "",
+        val kvType: String = "",
+        val threads: Int = 0,
+        val threadsBatch: Int = 0
     )
 
     /**
@@ -466,9 +649,39 @@ object LlamaEngine {
                 layers = layers,
                 requested = obj.optInt("requested", 0),
                 effective = obj.optInt("effective", 0),
-                devices = names.joinToString(" | ")
+                devices = names.joinToString(" | "),
+                fa = obj.optString("fa", ""),
+                kvType = obj.optString("kv_type", ""),
+                threads = obj.optInt("threads", 0),
+                threadsBatch = obj.optInt("threads_batch", 0)
             )
         }.getOrElse { GpuState(false, 0, 0, 0, "") }
+    }
+
+    /**
+     * prefill 线程数：默认吃满所有核心（最多 8）。
+     *
+     * prefill 是 big.LITTLE 上少数真能吃满小核的阶段（矩阵乘，没有严格的同步屏障拖累），
+     * 而 decode 逐 token 时同步屏障会被最慢的核拖住，所以两者用不同值。
+     */
+    private fun resolvePrefillThreads(config: LoadConfig): Int {
+        if (config.threadsBatch > 0) return config.threadsBatch.coerceIn(2, 8)
+        val cores = Runtime.getRuntime().availableProcessors()
+        return cores.coerceIn(2, 8)
+    }
+
+    /**
+     * KV/FA 组合偏好：优先用加载参数里的设置，其次是外部文件
+     * `Android/data/<pkg>/files/kv.conf`（给不改 UI 也能 A/B 的场合用）。
+     * 取值：auto（默认，FA+q8_0 优先）/ q8_fa / q8_auto / f16_auto。
+     */
+    private fun resolveKvMode(config: LoadConfig): String {
+        val fromConfig = config.kvMode.trim()
+        if (fromConfig.isNotEmpty() && fromConfig != "auto") return fromConfig
+        val dir = runCatching { appContext?.getExternalFilesDir(null) }.getOrNull() ?: return ""
+        val file = File(dir, "kv.conf")
+        if (!file.exists()) return ""
+        return runCatching { file.readText().trim() }.getOrDefault("")
     }
 
     private fun releaseLocked() {

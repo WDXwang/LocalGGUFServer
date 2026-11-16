@@ -31,10 +31,14 @@ object LlamaBridge {
     external fun nativeLoadModel(
         path: String,
         nThreads: Int,
+        /** prefill 用的线程数，通常比 decode 多（矩阵乘能吃满所有核） */
+        nThreadsBatch: Int,
         nCtx: Int,
         nBatch: Int,
         nGpuLayers: Int,
-        nMlock: Boolean
+        nMlock: Boolean,
+        /** KV/FA 组合偏好：空=默认（FA+q8_0 优先）；f16_auto / f16_fa / q8_auto 可强制指定 */
+        kvMode: String
     ): Long
 
     external fun nativeFreeModel(handle: Long)
@@ -45,11 +49,14 @@ object LlamaBridge {
 
     external fun nativeModelSize(handle: Long): Long
 
-    /** GPU 后端实况，JSON 串：offload_supported / n_layer / requested / effective / devices[] */
+    /** GPU 后端实况，JSON 串：offload_supported / n_layer / requested / effective / fa / kv_type / threads / devices[] */
     external fun nativeGpuInfo(handle: Long): String
 
-    /** 上一次生成耗时：[prefillMs, decodeMs, generatedTokens] */
+    /** 上一次生成规模：[prefillMs, decodeMs, generatedTokens, promptTokens, kvReuseTokens] */
     external fun nativeLastTiming(handle: Long): LongArray
+
+    /** 运行时调整线程数（热降级），不重建 context */
+    external fun nativeSetThreads(handle: Long, nThreads: Int, nThreadsBatch: Int)
 
     external fun nativeContextSize(handle: Long): Int
 

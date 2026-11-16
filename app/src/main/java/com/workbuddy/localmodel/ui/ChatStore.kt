@@ -64,26 +64,16 @@ object ChatStore {
         _streaming.value = ""
         _generating.value = true
 
-        // 温控降级：偏热时把单次生成长度砍半（少跑一会儿、少发热），
-        // 严重过热时直接不启动，避免把 SoC 顶到关机保护
-        val thermal = ThermalMonitor.status.value
-        if (thermal >= 4) {
-            _generating.value = false
-            _error.value = "设备温度过高（${ThermalMonitor.label}），已暂停推理。请让手机降温后再试。"
-            return
-        }
-        val effectiveParams = if (thermal >= 2) {
-            params.copy(maxTokens = (params.maxTokens / 2).coerceAtLeast(64))
-        } else {
-            params
-        }
-
+        // 温控策略已经下沉到 LlamaEngine（AI 与 HTTP 两条入口共用一套阈值 + 滞回），
+        // 这里不再重复砍 max_tokens —— 旧的 UI 专用逻辑会让"同一台机器、同样温度"
+        // 在 App 里降级、走 API 却满速，直到驱动超时。这里只保留"过热时提前给提示"，
+        // 真正的拒绝/降级由引擎统一做。
         val snapshot = _messages.value
         val myEpoch = epoch
         scope.launch {
             val result = LlamaEngine.chat(
                 snapshot,
-                effectiveParams,
+                params,
                 onToken = { chunk ->
                     if (myEpoch == epoch) {
                         _streaming.update { it + chunk }

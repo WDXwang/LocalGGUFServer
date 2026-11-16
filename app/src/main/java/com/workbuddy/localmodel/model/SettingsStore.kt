@@ -82,9 +82,31 @@ class SettingsStore(context: Context) {
     }
 
 
+    /**
+     * GPU 卸载层数。默认 -1 = 全部层。
+     *
+     * 旧默认是 0，结果是"装了 Vulkan 包但一层都没卸载"，跑的是纯 CPU ——
+     * 真机上 32 层全量卸载比纯 CPU 快 2~4 倍（prefill 9.4s → 2.3s，decode 2.7 → 6.0 t/s）。
+     * -1 在没有 Vulkan 后端的构建里会被 llama.cpp 忽略（等于纯 CPU），所以是安全默认。
+     * 加载时若全量卸载失败，引擎会自动退到 16 层 / 0 层并把生效值写回这里。
+     */
     var gpuLayers: Int
-        get() = prefs.getInt(KEY_GPU_LAYERS, 0)
+        get() = prefs.getInt(KEY_GPU_LAYERS, AUTO_GPU_LAYERS)
         set(value) = prefs.edit().putInt(KEY_GPU_LAYERS, value).apply()
+
+    /**
+     * 老的"默认 0 层"升级成 -1（全部层）。
+     *
+     * 只在用户没手动改过（值仍是 0）且没迁移过时做一次，之后用户自己选 0 不会再被覆盖。
+     */
+    fun migrateGpuLayersDefaultIfNeeded() {
+        if (prefs.getBoolean(KEY_GPU_MIGRATED, false)) return
+        val edited = prefs.edit()
+        if (prefs.getInt(KEY_GPU_LAYERS, AUTO_GPU_LAYERS) == 0) {
+            edited.putInt(KEY_GPU_LAYERS, AUTO_GPU_LAYERS)
+        }
+        edited.putBoolean(KEY_GPU_MIGRATED, true).apply()
+    }
 
     /**
      * 上一次加载的模型的层数。
@@ -108,6 +130,18 @@ class SettingsStore(context: Context) {
     var thinkMode: Boolean
         get() = prefs.getBoolean(KEY_THINK_MODE, false)
         set(value) = prefs.edit().putBoolean(KEY_THINK_MODE, value).apply()
+
+    /**
+     * KV/FA 组合偏好，默认 auto（FA 开启 + q8_0 KV）。
+     *
+     * 这不是"高级选项摆设"：FA 与 KV 量化的收益强依赖驱动。Mali 的 Vulkan 后端对部分
+     * attention 算子会退回 CPU，真机上出现过"开了 FA 反而慢好几倍"。
+     * 可取值：auto / q8_fa / q8_auto / f16_auto，改完重新加载模型生效，
+     * 生效值会写进日志与 /health（flash_attn / kv_type）。
+     */
+    var kvMode: String
+        get() = prefs.getString(KEY_KV_MODE, "auto") ?: "auto"
+        set(value) = prefs.edit().putString(KEY_KV_MODE, value).apply()
 
     var port: Int
         get() = prefs.getInt(KEY_PORT, 8080)
@@ -148,6 +182,9 @@ class SettingsStore(context: Context) {
         set(value) = prefs.edit().putString(KEY_LAST_MODEL, value).apply()
 
     private companion object {
+        /** -1 = 全部层卸载（自动），0 = 纯 CPU */
+        const val AUTO_GPU_LAYERS = -1
+        const val KEY_GPU_MIGRATED = "gpu_layers_auto_migrated"
         const val DEFAULT_CONTEXT = 8192
         const val LEGACY_DEFAULT_CONTEXT = 4096
         const val KEY_CONTEXT_MIGRATED = "context_default_migrated"
@@ -167,5 +204,6 @@ class SettingsStore(context: Context) {
         const val KEY_PRESET_NAME = "preset_name"
         const val KEY_LAST_MODEL = "last_model"
         const val KEY_THINK_MODE = "think_mode"
+        const val KEY_KV_MODE = "kv_mode"
     }
 }

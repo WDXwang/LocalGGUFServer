@@ -192,15 +192,32 @@ X-Api-Key: <你的 API Key>
 
 ### GET /health
 
-无需鉴权，用于探活。
+无需鉴权，用于探活 + 观测。除了加载状态，还会返回当前的性能与热状态，
+用于判断"慢"是 GPU 没生效、KV 没复用，还是机器在降频。
 
 ```bash
 curl http://192.168.1.20:8080/health
 ```
 
 ```json
-{"status":"ok","loaded":true,"model":"Qwen2.5-1.5B-Instruct-Q4_K_M","object":"local-model.health"}
+{"status":"ok","loaded":true,"model":"Qwen3.5-4B-Q4_K_M","object":"local-model.health",
+ "busy":false,"thermal_level":1,"context_size":8192,"context_limit":6800,
+ "gpu_layers_effective":32,"gpu_layers_total":32,"flash_attn":"enabled","kv_type":"q8_0",
+ "threads":4,"threads_batch":8,
+ "last":{"prompt_tokens":2100,"kv_reuse_tokens":1980,"kv_reuse_ratio":"0.943",
+          "prefill_ms":1320,"decode_ms":98000,"generated_tokens":512,"tokens_per_second":"5.22"}}
 ```
+
+字段含义：
+
+| 字段 | 说明 |
+|------|------|
+| `gpu_layers_effective` / `gpu_layers_total` | 实际卸载层数 / 模型总层数；`0` 表示退回了纯 CPU |
+| `flash_attn` | `enabled` / `auto` / `disabled`，FA 没开时 decode 会随上下文变长明显衰减 |
+| `kv_type` | `q8_0` 或 `f16`；驱动不支持时自动退回 f16 |
+| `threads` / `threads_batch` | decode / prefill 各自生效的线程数 |
+| `kv_reuse_ratio` | 上一次请求的 KV 命中率，多轮对话应接近 1，恒为 0 说明每轮都在全量重算 |
+| `thermal_level` | 0~6，`≥2` 引擎自动降级，`≥4` 直接返回 `503` |
 
 ### GET /v1/models
 
@@ -281,20 +298,37 @@ for chunk in resp:
 
 ## 已知限制
 
-- **仅 CPU 推理**：当前构建关闭了 Vulkan/OpenCL，GPU 层数设置不起作用。
-- **每轮全量 prefill**：请求开始时会清空 KV cache，多轮对话不会复用历史 KV，首 token 延迟随上下文增长。
-- **单请求串行**：同一时间只处理一个生成任务；并发请求会排队/返回 `已有生成任务正在进行`。
+- **Vulkan 需专用构建**：默认产物支持 Vulkan GPU 卸载（`-1` = 全部层），纯 CPU 构建请自行关闭 Vulkan 编译；`/health` 的 `gpu_layers_effective` 可验证是否真的卸载成功。
+- **单请求串行**：同一时间只处理一个生成任务；第二个请求立刻返回 `429` + `Retry-After`，不再排队等待。
 - **无 HTTPS**：接口为明文 HTTP，仅建议在可信局域网内使用。
-- **上下文截断**：prompt 超出上下文时从头部截断，并尽量保留 BOS。
+- **上下文预算**：prompt 上限为 `ctx × 90% - max_tokens`，超出时按消息粒度裁剪最早的历史（不裁剪 system 消息），并打 `context trim` 日志。
 - **聊天模板**：优先使用模型内置 chat template；不支持的模板会回退到 ChatML，效果可能下降。
-- **客户端断开不会立即停止推理**：生成会在当前请求结束后释放。
+- **客户端断开后停止**：SSE 客户端断开时，服务端会在下一次写 socket 失败时按请求 id 取消生成（实测 5~7 秒，取决于内核发现对端已关闭的时间；TCP 在收到 FIN 后还会继续接受写入，直到 RST 或发送缓冲写满）。显式取消请用新的请求 id，不要复用旧连接。
+- **KV 复用取决于模型架构**：普通 transformer（如 Qwen2.5 系列）多轮复用命中率 65%~94%；走 recurrent/hybrid memory 的模型（如本仓库实测的 Qwen3.5-4B，日志里是 `llama_memory_recurrent` + dsv4 HC fused ops）在此 llama.cpp 版本上 `llama_memory_seq_rm` 恒返回 false，`kv reuse: 0/*`，每轮都会退回全量 prefill。这不是预算问题，调大 ctx 也不会解锁。
+
+## 实测数据（真我 NEO7 · 天玑 9300+ / 16GB / Mali-G720）
+
+条件：ctx 4096（`context_limit=3174`），GPU 卸载满层，decode/prefill 线程 6/8，`max_tokens=64`，温度 0.3，电池温度 30°C（未触发热降级）。
+
+| 模型 | kv/fa | 轮次 | prompt | kv_reuse_ratio | prefill | decode tps |
+|---|---|---|---|---|---|---|
+| Qwen3.5-4B Q4_K_M | q8_0 + FA | 1→5 | 19→307 | 0.000（恒 0） | 847ms → 37280ms | 4.2 → 1.9 |
+| Qwen3.5-4B Q4_K_M | f16 + auto | 1→3 | 19→159 | 0.000（恒 0） | 693ms → 26760ms | 4.5 → 4.8 |
+| Qwen2.5-3B Q4_K_M | q8_0 + FA | 1→5 | 17→257 | 0.000 → 0.942 | 425ms → 80ms | 2.7 → 5.8 |
+
+结论：
+
+- **KV 复用只在普通 transformer 上生效**。Qwen2.5-3B 从第 2 轮起 `kv_reuse_ratio` 升到 0.65，第 5 轮 0.94，单轮 prefill 从 425ms 降到 80ms；Qwen3.5-4B 在这个 llama.cpp 版本上走 recurrent/hybrid memory，复用恒 0，只能全量 prefill，prefill 时间随历史线性增长（约 150~190ms/token）。
+- **FA + q8_0 与 f16 + auto 的速度差异在噪声内**（同为 150ms/token 级 prefill、4~5 tps decode），但 KV 显存减半：4096 ctx 下 68MiB vs 136MiB。因此默认保留 `q8_0`（省内存），不指望它提速。
+- **decode 随上下文增长衰减明显**：同样模型、ctx 100 以内约 4.5 tps，ctx 数百时降到 2~3 tps；预热单 token 能到 29 tps，说明衰减来自 KV 增长而非 GPU 本身。
 
 ## 性能建议
 
 - 选择量化模型：`Q4_K_M` / `Q5_K_M` 在体积与质量间较均衡。
 - 小内存手机优先 0.5B~3B 参数模型；7B 建议 12GB 以上内存。
-- 线程数设为性能核数量，`batchSize` 保持 512 即可。
-- 上下文越大，内存占用与首 token 延迟越高，按需设置。
+- 线程数设为性能核数量（decode 用大核），prefill 线程自动取全部核心（最多 8）。
+- 上下文越大，内存占用与首 token 延迟越高，按需设置；`/health` 的 `kv_reuse_ratio` 能看出多轮对话的复用命中率。
+- 设备偏热时引擎会自动把 `max_tokens` 砍半并降线程；过热（热状态 ≥4）直接返回 `503` + `Retry-After`。
 
 ## 常见问题
 
@@ -305,7 +339,7 @@ for chunk in resp:
 确认手机与 PC 同一网段、手机未锁屏断网、路由器未开启客户端隔离；可先用手机浏览器访问 `http://127.0.0.1:8080/health` 自测。
 
 **模型加载失败**
-优先确认文件是完整 GGUF；其次检查剩余内存是否足够（模型体积 + KV cache）。可降低上下文或换更小的量化模型。
+优先确认文件是完整 GGUF；其次检查剩余内存是否足够（模型体积 + 上下文 KV）。可降低上下文或换更小的量化模型。内存预检按"文件大小 + ctx×40KB（fp16 KV 上界）+ 256MB 增量"估算，mlock 不再额外乘 1.5（那会凭空多算 50%，把能跑的 3B 判成内存不足）。
 
 **接口返回 503**
 App 内尚未加载模型。先到「模型」页加载，再调用接口。

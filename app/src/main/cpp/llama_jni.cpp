@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <android/log.h>
+#include <sys/system_properties.h>
 
 #include <algorithm>
 #include <atomic>
@@ -68,9 +69,17 @@ struct LlamaSession {
     std::atomic<long long> last_prefill_ms{0};
     std::atomic<long long> last_gen_ms{0};
     std::atomic<int>       last_generated{0};
+    // 上一次请求的 prefill 规模与 KV 复用命中量，用来验证"预算调大后复用是否真的生效"
+    std::atomic<int>       last_prompt_tokens{0};
+    std::atomic<int>       last_kv_reuse_tokens{0};
 
     // 加载时请求的 GPU 层数，用于和实际生效值一起回显
     int32_t requested_gpu_layers = 0;
+    // 本次 context 实际拿到的 FA 请求值与 KV 类型（回退后可能与首选不同）
+    llama_flash_attn_type fa_mode = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    ggml_type kv_type = GGML_TYPE_F16;
+    int32_t n_threads_decode = 0;
+    int32_t n_threads_batch = 0;
 };
 
 long long now_ms() {
@@ -344,8 +353,8 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeBackendInit(JNIEnv * /*env*/
 
 JNIEXPORT jlong JNICALL
 Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
-        JNIEnv *env, jobject /*thiz*/, jstring path, jint n_threads, jint n_ctx,
-        jint n_batch, jint n_gpu_layers, jboolean n_mlock) {
+        JNIEnv *env, jobject /*thiz*/, jstring path, jint n_threads, jint n_threads_batch,
+        jint n_ctx, jint n_batch, jint n_gpu_layers, jboolean n_mlock, jstring kv_mode) {
 
     const std::string model_path = jstring_to_utf8(env, path);
     if (model_path.empty()) {
@@ -382,20 +391,77 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLoadModel(
     cparams.n_ctx = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 4096);
     cparams.n_batch = static_cast<uint32_t>(n_batch > 0 ? n_batch : 512);
     cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 512);
+    // decode 是逐 token 的，同步屏障被最慢的核拖住，只用大核最快；
+    // prefill 是矩阵乘，能吃满所有核心。两者最优值不同，所以分开设。
     cparams.n_threads = n_threads > 0 ? n_threads : 4;
-    cparams.n_threads_batch = cparams.n_threads;
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.n_threads_batch = n_threads_batch > 0 ? n_threads_batch : cparams.n_threads;
     cparams.no_perf = true;
 
-    session->ctx = llama_init_from_model(session->model, cparams);
+    // Flash Attention：AUTO 只是"看情况"，在 Vulkan 上可能悄悄退回朴素 attention，
+    // 而 decode 随上下文变长的衰减（kv=56 时 3.43 t/s、kv=500 时 0.24 t/s）正是它的典型症状。
+    // 这里显式要求开启；开启后 KV cache 才能用 q8_0（量化 KV 要求 FA）。
+    // 两件都必须带回退：部分驱动上 FA+q8_0 会让 llama_init_from_model 直接失败，
+    // 那就依次退回 q8_0+AUTO、f16+ENABLED、f16+AUTO，保证"至少能跑"。
+    struct KvAttempt {
+        llama_flash_attn_type fa;
+        ggml_type kv_type;
+        const char *name;
+    };
+    const KvAttempt attempts[] = {
+            {LLAMA_FLASH_ATTN_TYPE_ENABLED,  GGML_TYPE_Q8_0, "fa=enabled kv=q8_0"},
+            {LLAMA_FLASH_ATTN_TYPE_ENABLED,  GGML_TYPE_F16,  "fa=enabled kv=f16"},
+            {LLAMA_FLASH_ATTN_TYPE_AUTO,     GGML_TYPE_Q8_0, "fa=auto kv=q8_0"},
+            {LLAMA_FLASH_ATTN_TYPE_AUTO,     GGML_TYPE_F16,  "fa=auto kv=f16"},
+    };
+    // kv_mode 决定首选哪一种组合，其余按顺序作为回退。
+    // 真机上 FA/q8_0 的收益不是必然的：Mali 的 Vulkan 后端可能把部分算子退回 CPU，
+    // 反而比"朴素 f16 attention"慢好几倍。留这个开关才能实测而不是靠猜。
+    //   默认（空/auto）→ enabled+q8_0 优先
+    //   q8_auto / q8_fa / f16_auto / f16_fa → 指定组合优先
+    int first = 0;
+    std::string mode;
+    if (kv_mode != nullptr) {
+        mode = jstring_to_utf8(env, kv_mode);
+    }
+    // 开发用后门：`adb shell setprop debug.llama.kv_mode f16_auto` 可直接覆盖 UI 设置，
+    // 用于不改代码就能在真机上 A/B 不同 KV/FA 组合（setprop 已设时以它为准）
+    char prop[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.llama.kv_mode", prop) > 0) {
+        mode = prop;
+        LOGI("kv mode overridden by system property: %s", mode.c_str());
+    }
+    if (mode == "f16_fa") first = 1;
+    else if (mode == "q8_auto") first = 2;
+    else if (mode == "f16_auto") first = 3;
+    int attempt_index = first;
+    int tried = 0;
+    for (; tried < 4; ++tried, attempt_index = (attempt_index + 1) % 4) {
+        const KvAttempt &a = attempts[attempt_index];
+        cparams.flash_attn_type = a.fa;
+        cparams.type_k = a.kv_type;
+        cparams.type_v = a.kv_type;
+        session->ctx = llama_init_from_model(session->model, cparams);
+        if (session->ctx != nullptr) {
+            session->fa_mode = a.fa;
+            session->kv_type = a.kv_type;
+            if (attempt_index != first) {
+                LOGW("context init fell back to %s", a.name);
+            }
+            LOGI("context kv config: %s", a.name);
+            break;
+        }
+        LOGE("context init failed with %s, trying next fallback", a.name);
+    }
     if (session->ctx == nullptr) {
-        LOGE("failed to create context");
+        LOGE("failed to create context (all kv/fa fallbacks failed)");
         llama_model_free(session->model);
         delete session;
         return 0;
     }
 
     session->vocab = llama_model_get_vocab(session->model);
+    session->n_threads_decode = cparams.n_threads;
+    session->n_threads_batch = cparams.n_threads_batch;
     const char *tmpl = llama_model_chat_template(session->model, nullptr);
     if (tmpl != nullptr) {
         session->chat_template = tmpl;
@@ -493,6 +559,13 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGpuInfo(JNIEnv *env, jobject
     out += ",\"n_layer\":" + std::to_string(n_layer);
     out += ",\"requested\":" + std::to_string(session->requested_gpu_layers);
     out += ",\"effective\":" + std::to_string(effective);
+    out += ",\"fa\":\"" +
+           std::string(session->fa_mode == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "enabled"
+                       : session->fa_mode == LLAMA_FLASH_ATTN_TYPE_DISABLED ? "disabled" : "auto") +
+           "\"";
+    out += ",\"kv_type\":\"" + std::string(session->kv_type == GGML_TYPE_Q8_0 ? "q8_0" : "f16") + "\"";
+    out += ",\"threads\":" + std::to_string(session->n_threads_decode);
+    out += ",\"threads_batch\":" + std::to_string(session->n_threads_batch);
     out += ",\"devices\":[";
     for (size_t i = 0; i < n_dev; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -524,24 +597,53 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGpuInfo(JNIEnv *env, jobject
 }
 
 /**
- * 上一次生成的耗时（毫秒）：返回 [prefill_ms, gen_ms, generated_tokens]。
- * 有了它 Kotlin 侧才能算 t/s 与 TTFT，而不是只能看日志。
+ * 上一次生成的耗时与规模：返回
+ *   [prefill_ms, gen_ms, generated_tokens, prompt_tokens, kv_reuse_tokens]
+ *
+ * prompt_tokens 是这次真正提交给模型的 prompt 长度，kv_reuse_tokens 是其中已命中的部分；
+ * 两者一起才能算出复用率（reuse/prompt），否则"预算调大到底有没有用"只能靠猜。
  */
 JNIEXPORT jlongArray JNICALL
 Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeLastTiming(JNIEnv *env, jobject /*thiz*/,
                                                               jlong handle) {
     auto *session = reinterpret_cast<LlamaSession *>(handle);
-    jlong values[3] = {0, 0, 0};
+    jlong values[5] = {0, 0, 0, 0, 0};
     if (session != nullptr) {
         values[0] = session->last_prefill_ms.load();
         values[1] = session->last_gen_ms.load();
         values[2] = session->last_generated.load();
+        values[3] = session->last_prompt_tokens.load();
+        values[4] = session->last_kv_reuse_tokens.load();
     }
-    jlongArray arr = env->NewLongArray(3);
+    jlongArray arr = env->NewLongArray(5);
     if (arr != nullptr) {
-        env->SetLongArrayRegion(arr, 0, 3, values);
+        env->SetLongArrayRegion(arr, 0, 5, values);
     }
     return arr;
+}
+
+/**
+ * 运行时调整线程数（热降级用）。
+ * llama_set_n_threads 不重建 context，只是换线程池规模，所以可以在推理间隙随时降/升，
+ * 这比"只砍 max_tokens"更能压低瞬时功耗 —— 8 线程跑 prefill 的峰值电流明显高于 4 线程。
+ */
+JNIEXPORT void JNICALL
+Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeSetThreads(JNIEnv * /*env*/, jobject /*thiz*/,
+                                                              jlong handle, jint n_threads,
+                                                              jint n_threads_batch) {
+    auto *session = reinterpret_cast<LlamaSession *>(handle);
+    if (session == nullptr || session->ctx == nullptr) {
+        return;
+    }
+    const int32_t t = n_threads > 0 ? n_threads : session->n_threads_decode;
+    const int32_t tb = n_threads_batch > 0 ? n_threads_batch : session->n_threads_batch;
+    if (t == session->n_threads_decode && tb == session->n_threads_batch) {
+        return;
+    }
+    llama_set_n_threads(session->ctx, t, tb);
+    session->n_threads_decode = t;
+    session->n_threads_batch = tb;
+    LOGI("threads adjusted: decode=%d batch=%d", t, tb);
 }
 
 JNIEXPORT jint JNICALL
@@ -732,8 +834,13 @@ Java_com_workbuddy_localmodel_llm_LlamaBridge_nativeGenerate(
         llama_memory_clear(mem, true);
     }
     session->kv_tokens.resize(static_cast<size_t>(reuse));
+    session->last_prompt_tokens.store(n_tokens);
+    session->last_kv_reuse_tokens.store(reuse);
     if (reuse > 0) {
-        LOGI("kv reuse: %d/%d prompt tokens already cached", reuse, n_tokens);
+        LOGI("kv reuse: %d/%d prompt tokens already cached (%.0f%%)", reuse, n_tokens,
+             n_tokens > 0 ? 100.0 * reuse / n_tokens : 0.0);
+    } else {
+        LOGI("kv reuse: 0/%d (full prefill)", n_tokens);
     }
 
     // 4. 只 decode 公共前缀之后的部分（首次请求时 reuse == 0，等于全量 prefill）
