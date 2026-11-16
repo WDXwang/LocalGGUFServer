@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -27,8 +28,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -42,6 +45,13 @@ import com.workbuddy.localmodel.llm.EngineState
 import com.workbuddy.localmodel.llm.GenParams
 import com.workbuddy.localmodel.llm.LlamaEngine
 import com.workbuddy.localmodel.util.ThermalMonitor
+import kotlinx.coroutines.launch
+
+/**
+ * scrollToItem 的第二个参数：把目标 item 顶到视口上方这么远，效果等价于"滚到底"。
+ * LazyList 会把它裁到最大可滚动范围，写大一点不会滚过头。
+ */
+private const val SCROLL_TO_BOTTOM_OFFSET = 10_000
 
 @Composable
 fun ChatScreen(modifier: Modifier = Modifier) {
@@ -56,6 +66,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 
     var input by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
 
     val ready = engineState is EngineState.Ready
     val itemCount = messages.size + if (generating) 1 else 0
@@ -85,11 +96,40 @@ fun ChatScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    /**
+     * 是否自动跟随到底部。
+     *
+     * 不用"现在贴不贴底"来当开关：流式输出时最后一条每来一个 chunk 就长高一点，
+     * 内容长高的那一瞬间"贴底"必然为假，于是自动跟随会把自己关掉，页面就开始慢慢往上漂。
+     * 改成按滚动方向判断——只有位置真的往上走了（用户上滑看历史）才关掉跟随，
+     * 用户自己滑回底部（列表不能再往下滚）再重新打开。
+     * 程序触发的 scrollToItem 只会让位置往下走，所以不会误关自己。
+     */
+    var autoFollow by remember { mutableStateOf(true) }
+
+    LaunchedEffect(listState) {
+        var prevIndex = listState.firstVisibleItemIndex
+        var prevOffset = listState.firstVisibleItemScrollOffset
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .collect { (index, offset) ->
+                val movedUp = index < prevIndex || (index == prevIndex && offset < prevOffset)
+                if (movedUp) {
+                    autoFollow = false
+                } else if (!listState.canScrollForward) {
+                    // 用户滑回到最底部，恢复跟随
+                    autoFollow = true
+                }
+                prevIndex = index
+                prevOffset = offset
+            }
+    }
+
     LaunchedEffect(itemCount, streaming.length) {
-        if (itemCount > 0) {
+        if (itemCount > 0 && autoFollow) {
             // 流式输出时每个 chunk 都会触发本 effect，用 scrollToItem 直接定位，
-            // 避免 animateScrollToItem 被反复打断导致列表抖动
-            listState.scrollToItem(itemCount - 1)
+            // 避免 animateScrollToItem 被反复打断导致列表抖动。
+            // 第二个参数把最后一条顶到视口上方，等价于"滚到底"，长回答也看得到最新一行。
+            listState.scrollToItem(itemCount - 1, SCROLL_TO_BOTTOM_OFFSET)
         }
     }
 
@@ -103,19 +143,50 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             )
         }
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            itemsIndexed(messages) { _, message ->
-                MessageBubble(message, onCopy = copyToClipboard)
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                itemsIndexed(messages) { _, message ->
+                    MessageBubble(message, onCopy = copyToClipboard)
+                }
+                if (generating) {
+                    item {
+                        MessageBubble(
+                            ChatMessage("assistant", streaming.ifEmpty { "正在思考..." }),
+                            streaming = true
+                        )
+                    }
+                }
             }
-            if (generating) {
-                item {
-                    MessageBubble(
-                        ChatMessage("assistant", streaming.ifEmpty { "正在思考..." }),
-                        streaming = true
+
+            // 用户往上翻之后才出现：一条是提示"下面还有内容在生成"，一条是回去的路。
+            // 生成中显示"还有内容在生成"，生成结束显示"回到底部"。
+            if (!autoFollow) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 8.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shadowElevation = 4.dp
+                ) {
+                    Text(
+                        if (generating) "还有内容在生成 · 回到底部" else "回到底部",
+                        modifier = Modifier
+                            .clickable {
+                                scope.launch {
+                                    listState.scrollToItem(
+                                        (itemCount - 1).coerceAtLeast(0),
+                                        SCROLL_TO_BOTTOM_OFFSET
+                                    )
+                                }
+                            }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
                     )
                 }
             }
